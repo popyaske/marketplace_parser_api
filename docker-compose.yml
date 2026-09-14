@@ -1,0 +1,87 @@
+# ============================================================
+# docker-compose.yml для Marketplace Parser
+#
+# Использует ЛОКАЛЬНЫЙ Chrome на Windows (не контейнерный).
+#
+# Требования:
+#   1. Локальный Chrome запущен с CDP:
+#      start-chrome-cdp.bat
+#   2. В нём открыты вкладки:
+#      - https://www.ozon.ru/
+#      - https://www.wildberries.ru/
+#      - https://aliexpress.ru/
+#
+# Запуск:
+#   docker compose up -d
+# ============================================================
+
+services:
+  # ----------------------------------------------------------
+  # FastAPI-сервер парсера
+  # ----------------------------------------------------------
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: marketplace-parser
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # === CDP: подключаемся к ЛОКАЛЬНОМУ Chrome на Windows ===
+      CDP_HOST: 192.168.65.254   # ← Docker-хост (Windows)
+      CDP_PORT: 9222                    # ← порт локального Chrome
+
+      # Таймауты
+      YANDEX_TIMEOUT: 40
+      OZON_TIMEOUT: 30
+      WB_TIMEOUT: 15
+      ALI_TIMEOUT: 30
+
+      # Rate limiting
+      YANDEX_MIN_GAP: 1.5
+      OZON_MIN_GAP: 2.5
+      WB_MIN_GAP: 1.5
+      ALI_MIN_GAP: 3.0
+
+      # Логирование
+      LOG_LEVEL: INFO
+
+      # Прокси (опционально)
+      # OZON_PROXY: http://user:pass@residential-proxy:port
+      # YANDEX_PROXY: http://user:pass@residential-proxy:port
+      # WB_PROXY: http://user:pass@residential-proxy:port
+      # ALI_PROXY: http://user:pass@residential-proxy:port
+
+    # НЕТ depends_on на chrome — контейнер не нужен
+    networks:
+      - parser-network
+
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Доступ к host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Логи
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----------------------------------------------------------
+  # Chrome-сервис УБРАН — используем локальный Chrome
+  # ----------------------------------------------------------
+
+networks:
+  parser-network:
+    driver: bridge

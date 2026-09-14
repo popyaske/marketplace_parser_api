@@ -5,13 +5,12 @@ from typing import Tuple
 
 from parsers import YandexParser, OzonParser, WildberriesParser, AliexpressParser
 from parsers.base import BaseParser
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class MarketplaceFactory:
-    """Определяет маркетплейс по URL и возвращает парсер"""
-
     PATTERNS = {
         "yandex": r"market\.yandex",
         "ozon": r"ozon\.ru",
@@ -26,8 +25,11 @@ class MarketplaceFactory:
         "aliexpress": AliexpressParser,
     }
 
+    # Парсеры, которым нужен Chrome CDP
+    CDP_PARSERS = {"ozon", "wildberries", "aliexpress"}
+
     def __init__(self):
-        self._parsers: dict[str, BaseParser] = {}
+        self._parsers = {}
 
     def identify(self, url: str) -> str:
         for key, pattern in self.PATTERNS.items():
@@ -40,7 +42,14 @@ class MarketplaceFactory:
         if key == "unknown":
             raise ValueError(f"Неизвестный маркетплейс для URL: {url}")
         if key not in self._parsers:
-            self._parsers[key] = self.CREATORS[key]()
+            parser_class = self.CREATORS[key]
+            if key in self.CDP_PARSERS:
+                self._parsers[key] = parser_class(
+                    cdp_host=settings.CDP_HOST,
+                    cdp_port=settings.CDP_PORT,
+                )
+            else:
+                self._parsers[key] = parser_class()
         return key, self._parsers[key]
 
     def close_all(self):

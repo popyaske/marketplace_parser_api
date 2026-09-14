@@ -10,6 +10,10 @@ class Settings:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
 
+    # CDP
+    CDP_HOST: str = os.getenv("CDP_HOST", "127.0.0.1")
+    CDP_PORT: int = int(os.getenv("CDP_PORT", "9222"))
+
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # Таймауты для API-запросов (в секундах)

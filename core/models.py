@@ -16,11 +16,21 @@ class MarketplaceType(str, Enum):
 class ProductData:
     """Данные о товаре"""
     title: str = "Не найдено"
-    discount_price: str = "Не найдено"
-    old_price: str = "Не найдено"
+    # Цены
+    price_rub: Optional[float] = None           # основная цена
+    price_with_plus: Optional[float] = None     # цена с подпиской (Yandex Plus, Ozon Card)
+    price_original_rub: Optional[float] = None  # зачёркнутая цена
+    # Метаданные
     url: str = "Не найдено"
     marketplace: str = "unknown"
     sku: Optional[str] = None
+    seller: str = ""
+    brand: str = ""
+    rating: Optional[float] = None
+    rating_count: Optional[int] = None
+    in_stock: Optional[bool] = None
     image_url: Optional[str] = None
+    # Статус
     success: bool = True
     error: Optional[str] = None
+    tier_used: str = ""   # curl_cffi, cdp, ssr, api

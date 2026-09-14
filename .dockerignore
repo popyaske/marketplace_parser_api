@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# Тесты
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Логи
+*.log
+
+# Chrome профили (ОГРОМНЫЕ!)
+chrome-scraping/
+chrome-profile/
+chrome-data/
+
+# Node.js (если есть)
+node_modules/
+package-lock.json
+package.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Локальные файлы
+.env
+*.json
+!requirements.txt
+!requirements-test.txt
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+
+# Docs
+*.md
+!README.md

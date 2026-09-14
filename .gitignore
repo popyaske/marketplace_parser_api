@@ -1,20 +1,44 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
 venv/
 env/
-.env
-.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Node
-node_modules/
-dist/
-build/
+# Тесты и документация
+tests/
+*.md
+!README.md
+.pytest_cache/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Локальные файлы
+.env
+*.log
+*.json
+!requirements.txt
+
+# Chrome профиль
+chrome-scraping/
+chrome-profile/
+
+#https://github.com/Vladimir-Human/ru-marketplace-mcp/tree/main

@@ -5,18 +5,15 @@ from pydantic import BaseModel, Field
 from typing import Optional
 
 from services.marketplace import MarketplaceFactory
-from core.formatters import PriceFormatter, TextGenerator
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["parse"])
 factory = MarketplaceFactory()
 
 
-# === Pydantic-схемы ===
-
 class ParseRequest(BaseModel):
-    url: str = Field(..., description="URL товара с маркетплейса")
-    format_prices: bool = Field(True, description="Форматировать цены (1 990₽)")
+    url: str = Field(..., description="URL товара")
+    format_prices: bool = Field(True, description="Форматировать цены")
     generate_post: bool = Field(True, description="Генерировать текст поста")
 
 
@@ -25,35 +22,54 @@ class ProductResponse(BaseModel):
     marketplace: Optional[str] = None
     sku: Optional[str] = None
     title: Optional[str] = None
-    discount_price: Optional[str] = None
-    old_price: Optional[str] = None
-    url: Optional[str] = None
+    price_rub: Optional[float] = None
+    price_with_plus: Optional[float] = None
+    price_original_rub: Optional[float] = None
+    seller: Optional[str] = None
+    brand: Optional[str] = None
+    rating: Optional[float] = None
+    rating_count: Optional[int] = None
+    in_stock: Optional[bool] = None
     image_url: Optional[str] = None
+    url: Optional[str] = None
+    tier_used: Optional[str] = None
     post_text: Optional[str] = None
     error: Optional[str] = None
 
 
-class HealthResponse(BaseModel):
-    status: str
-    app: str
-    version: str
+def _format_price(v: Optional[float]) -> str:
+    if v is None:
+        return "Не найдено"
+    if v >= 1000:
+        return f"{int(v):,}".replace(",", " ") + "₽"
+    return f"{v:.0f}₽"
 
 
-# === Эндпоинты ===
+def _generate_post(data) -> str:
+    # Основная цена — обычная, если есть; иначе подписочная с пометкой
+    if data.price_rub is not None:
+        new_price_str = _format_price(data.price_rub)
+    elif data.price_with_plus is not None:
+        new_price_str = f"{_format_price(data.price_with_plus)} (с подпиской Яндекс Плюс)"
+    else:
+        new_price_str = "Не найдено"
 
-@router.get("/health", response_model=HealthResponse)
-async def health():
-    from config.settings import settings
-    return HealthResponse(
-        status="ok",
-        app=settings.APP_NAME,
-        version=settings.VERSION,
+    return (
+        f"🔥 **{data.title}**\n\n"
+        f"Старая цена — {_format_price(data.price_original_rub)}\n"
+        f"Новая цена — {new_price_str}\n\n"
+        f"🙈 {data.url}\n\n"
+        f"🤫 [Чат](https://t.me/+uVvV1JcRjF03YjIy)"
     )
+
+
+@router.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @router.post("/parse", response_model=ProductResponse)
 async def parse_product(req: ParseRequest):
-    """Спарсить товар по URL"""
     try:
         key, parser = factory.get_parser(req.url)
     except ValueError as e:
@@ -73,20 +89,81 @@ async def parse_product(req: ParseRequest):
             error=data.error or "Не удалось получить данные",
         )
 
-    if req.format_prices:
-        data.discount_price = PriceFormatter.format_price(data.discount_price)
-        data.old_price = PriceFormatter.format_price(data.old_price)
-
-    post_text = TextGenerator.generate(data) if req.generate_post else None
+    post_text = _generate_post(data) if req.generate_post else None
 
     return ProductResponse(
         success=True,
         marketplace=key,
         sku=data.sku,
         title=data.title,
-        discount_price=data.discount_price,
-        old_price=data.old_price,
-        url=data.url,
+        price_rub=data.price_rub,
+        price_with_plus=data.price_with_plus,
+        price_original_rub=data.price_original_rub,
+        seller=data.seller,
+        brand=data.brand,
+        rating=data.rating,
+        rating_count=data.rating_count,
+        in_stock=data.in_stock,
         image_url=data.image_url,
+        url=data.url,
+        tier_used=data.tier_used,
         post_text=post_text,
     )
+
+@router.get("/cdp-check")
+async def cdp_check():
+    """
+    Проверить доступность Chrome CDP.
+
+    Возвращает host и port, к которым реально подключается парсер —
+    это помогает понять, куда смотрит код в Docker.
+    """
+    import httpx
+    from config.settings import settings
+
+    # Достаём значения явно — если settings это модуль, увидим это
+    host = getattr(settings, "CDP_HOST", None)
+    port = getattr(settings, "CDP_PORT", None)
+
+    # Диагностика: показываем, откуда взялись значения
+    debug = {
+        "settings_type": type(settings).__name__,
+        "has_CDP_HOST": hasattr(settings, "CDP_HOST"),
+        "has_CDP_PORT": hasattr(settings, "CDP_PORT"),
+        "raw_host": host,
+        "raw_port": port,
+    }
+
+    # Если settings — модуль, атрибутов нет, ставим дефолты для docker
+    if host is None:
+        host = "chrome"
+    if port is None:
+        port = 3000
+
+    try:
+        r = httpx.get(f"http://{host}:{port}/json/version", timeout=3.0)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "available": True,
+                "host": host,
+                "port": port,
+                "browser": data.get("Browser"),
+                "ws_url": data.get("webSocketDebuggerUrl"),
+                **debug,
+            }
+        return {
+            "available": False,
+            "host": host,
+            "port": port,
+            "error": f"HTTP {r.status_code}",
+            **debug,
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "host": host,
+            "port": port,
+            "error": str(e),
+            **debug,
+        }
