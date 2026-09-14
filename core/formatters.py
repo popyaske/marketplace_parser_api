@@ -8,24 +8,28 @@ class PriceFormatter:
 
     @staticmethod
     def format_price(price_str: str) -> str:
-        """Форматирует цену с разделителем тысяч и знаком ₽"""
+        """Форматирует цену с разделителем тысяч и знаком ₽."""
         if not price_str or price_str in ("Не найдено", "Цена со скидкой", "Цена без скидки"):
             return price_str
 
-        # Убираем все лишнее, оставляем цифры
-        digits = re.sub(r'\D', '', price_str)
-        if not digits:
+        # Убираем всё, кроме цифр и точки
+        cleaned = re.sub(r'[^\d.]', '', str(price_str))
+        if not cleaned:
             return price_str
 
         try:
-            number = int(digits)
+            number = float(cleaned)
         except ValueError:
             return price_str
 
+        if number <= 0:
+            return price_str
+
+        # Форматируем с разделителем тысяч (без копеек)
         if number >= 1000:
-            formatted = f"{number:,}".replace(',', ' ')
+            formatted = f"{int(number):,}".replace(',', ' ')
         else:
-            formatted = str(number)
+            formatted = str(int(number))
 
         return f"{formatted}₽"
 

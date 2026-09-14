@@ -1,23 +1,41 @@
-# ============================================================
-# docker-compose.yml для Marketplace Parser
-#
-# Использует ЛОКАЛЬНЫЙ Chrome на Windows (не контейнерный).
-#
-# Требования:
-#   1. Локальный Chrome запущен с CDP:
-#      start-chrome-cdp.bat
-#   2. В нём открыты вкладки:
-#      - https://www.ozon.ru/
-#      - https://www.wildberries.ru/
-#      - https://aliexpress.ru/
-#
-# Запуск:
-#   docker compose up -d
-# ============================================================
-
 services:
   # ----------------------------------------------------------
-  # FastAPI-сервер парсера
+  # RabbitMQ — брокер сообщений
+  # ----------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: marketplace-rabbitmq
+    restart: unless-stopped
+
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # Web UI (http://localhost:15672, guest/guest)
+
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+
+    networks:
+      - parser-network
+
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----------------------------------------------------------
+  # FastAPI-сервер (producer)
   # ----------------------------------------------------------
   parser:
     build:
@@ -30,36 +48,30 @@ services:
       - "8000:8000"
 
     environment:
-      # === CDP: подключаемся к ЛОКАЛЬНОМУ Chrome на Windows ===
-      CDP_HOST: 192.168.65.254   # ← Docker-хост (Windows)
-      CDP_PORT: 9222                    # ← порт локального Chrome
+      CDP_HOST: 192.168.65.254
+      CDP_PORT: 9222
 
-      # Таймауты
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+
       YANDEX_TIMEOUT: 40
       OZON_TIMEOUT: 30
       WB_TIMEOUT: 15
       ALI_TIMEOUT: 30
 
-      # Rate limiting
       YANDEX_MIN_GAP: 1.5
       OZON_MIN_GAP: 2.5
       WB_MIN_GAP: 1.5
       ALI_MIN_GAP: 3.0
 
-      # Логирование
       LOG_LEVEL: INFO
 
-      # Прокси (опционально)
-      # OZON_PROXY: http://user:pass@residential-proxy:port
-      # YANDEX_PROXY: http://user:pass@residential-proxy:port
-      # WB_PROXY: http://user:pass@residential-proxy:port
-      # ALI_PROXY: http://user:pass@residential-proxy:port
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
-    # НЕТ depends_on на chrome — контейнер не нужен
     networks:
       - parser-network
 
-    # Healthcheck
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
       interval: 30s
@@ -67,11 +79,9 @@ services:
       retries: 3
       start_period: 10s
 
-    # Доступ к host.docker.internal
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    # Логи
     logging:
       driver: "json-file"
       options:
@@ -79,9 +89,55 @@ services:
         max-file: "3"
 
   # ----------------------------------------------------------
-  # Chrome-сервис УБРАН — используем локальный Chrome
+  # Worker — читает очередь и парсит URL
   # ----------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: marketplace-worker
+    restart: unless-stopped
+
+    command: ["python", "worker.py"]
+
+    environment:
+      CDP_HOST: 192.168.65.254
+      CDP_PORT: 9222
+
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+
+      YANDEX_TIMEOUT: 40
+      OZON_TIMEOUT: 30
+      WB_TIMEOUT: 15
+      ALI_TIMEOUT: 30
+
+      YANDEX_MIN_GAP: 1.5
+      OZON_MIN_GAP: 2.5
+      WB_MIN_GAP: 1.5
+      ALI_MIN_GAP: 3.0
+
+      LOG_LEVEL: INFO
+
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+    networks:
+      - parser-network
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   parser-network:
     driver: bridge
+
+volumes:
+  rabbitmq-data:
+    driver: local

@@ -1,0 +1,25 @@
+# ============================================================
+# Dockerfile для Worker (без HTTP)
+# ============================================================
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir websocket-client
+
+COPY . .
+
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# НЕТ EXPOSE — worker не слушает порт
+# НЕТ HEALTHCHECK — worker не HTTP-сервер
+
+CMD ["python", "worker.py"]

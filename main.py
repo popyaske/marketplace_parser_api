@@ -1,16 +1,18 @@
 """Точка входа FastAPI"""
 import logging
 from contextlib import asynccontextmanager
+import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import settings
 from routers.parse import router as parse_router
+from routers.queue import router as queue_router
 from routers.parse import factory as marketplace_factory
+from broker.connection import broker
 
 
-# === Логирование ===
 logging.basicConfig(
     level=settings.LOG_LEVEL,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -19,12 +21,24 @@ logging.basicConfig(
 logger = logging.getLogger("app")
 
 
-# === Lifespan: закрываем клиенты при выключении ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Запуск {settings.APP_NAME} v{settings.VERSION}")
+
+    # Подключаемся к RabbitMQ с retry (не блокируем старт при недоступности)
+    try:
+        await asyncio.wait_for(broker.connect(), timeout=60.0)
+        logger.info("RabbitMQ подключён")
+    except Exception as e:
+        logger.warning(f"RabbitMQ недоступен: {e}. Queue API будет возвращать ошибки.")
+
     yield
-    logger.info("Остановка, закрываем HTTP-клиенты")
+
+    logger.info("Остановка, закрываем соединения")
+    try:
+        await broker.close()
+    except Exception:
+        pass
     marketplace_factory.close_all()
 
 
@@ -44,6 +58,7 @@ app.add_middleware(
 )
 
 app.include_router(parse_router)
+app.include_router(queue_router)
 
 
 @app.get("/", tags=["root"])
@@ -53,6 +68,7 @@ async def root():
         "version": settings.VERSION,
         "docs": "/docs",
         "health": "/api/v1/health",
+        "queue": "/api/v1/queue/status",
     }
 
 
