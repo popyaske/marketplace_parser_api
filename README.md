@@ -1,12 +1,12 @@
 # Marketplace Parser API
 
-FastAPI-сервис для парсинга товаров с российских и китайских маркетплейсов.
+FastAPI-сервис для парсинга товаров с российских и китайских маркетплейсов с **асинхронной обработкой через RabbitMQ**, **сохранением в PostgreSQL** и **React-дашбордом**.
 
 **Поддерживается 5 маркетплейсов:**
 
 | Маркетплейс | Метод | Что доступно |
 |-------------|-------|--------------|
-| 🟦 **Ozon** | Chrome CDP + composer-api.bx | Поиск, карточки, цены, рейтинги |
+| 🟦 **Ozon** | Chrome CDP + composer-api.bx | Карточки, цены, рейтинги |
 | 🟪 **Wildberries** | Chrome CDP + card.wb.ru v4 | Карточки, цены, рейтинги |
 | 🟧 **AliExpress** | Chrome CDP + чтение DOM | Карточки, цены, рейтинги |
 | 🟨 **Яндекс Маркет** | SSR (widget state) | Карточки, цены |
@@ -16,32 +16,69 @@ FastAPI-сервис для парсинга товаров с российск�
 
 ---
 
+## 🏗️ Архитектура
+
+```
+┌────────────────────┐
+│   React Dashboard  │  http://localhost:3000
+│   (nginx)          │
+└──────────┬─────────┘
+           │ POST /api/v1/queue/enqueue
+           │ GET  /api/v1/results
+           ▼
+┌────────────────────┐
+│   FastAPI Parser   │  http://localhost:8000
+│   + Swagger        │  /docs
+└──────────┬─────────┘
+           │ publish
+           ▼
+┌────────────────────┐
+│   RabbitMQ         │  http://localhost:15672
+│   parser.incoming  │  guest/guest
+└──────────┬─────────┘
+           │ consume
+           ▼
+┌────────────────────┐
+│   Worker           │
+│   httpx → CDP      │
+│   parse → publish  │
+└──────────┬─────────┘
+           │ publish + save
+           ▼
+┌────────────────────┐     ┌──────────────────┐
+│   RabbitMQ         │     │   PostgreSQL     │
+│   parser.results   │     │   products       │
+└────────────────────┘     └──────────────────┘
+                                    ▲
+                                    │ SELECT
+                                    │
+                           ┌────────┴─────────┐
+                           │   Dashboard      │
+                           │   GET /results   │
+                           └──────────────────┘
+```
+
+---
+
 ## 📋 Требования
 
-- **Python 3.12+**
-- **Google Chrome** или **Microsoft Edge** (для CDP)
-- **Windows / Linux / macOS**
+- **Docker Desktop** (Windows / macOS) или **Docker + Docker Compose** (Linux)
+- **Google Chrome** или **Microsoft Edge** (для CDP на хосте)
+- **8 GB RAM** минимум, **16 GB** рекомендуется
+- Свободное место: ~3 GB
 
 ---
 
 ## ⚡ Быстрый старт
 
-### 1. Установка зависимостей
+### 1. Клонировать репозиторий
 
 ```bash
-python -m venv .venv
-
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows
-.venv\Scripts\activate
-
-pip install -r requirements.txt
-pip install websocket-client
+git clone <your-repo-url>
+cd channel_promo
 ```
 
-### 2. Запуск Chrome с CDP
+### 2. Запустить Chrome с CDP
 
 Chrome с CDP нужен для обхода Cloudflare на Ozon, Wildberries и AliExpress.
 
@@ -58,13 +95,13 @@ if not exist "%CHROME%" (
     exit /b 1
 )
 
-if not exist "C:\Users\simon\Desktop\channel_promo\chrome-scraping" mkdir C:\Users\simon\Desktop\channel_promo\chrome-scraping
+if not exist "%USERPROFILE%\chrome-scraping" mkdir "%USERPROFILE%\chrome-scraping"
 
 start "" "%CHROME%" ^
     --remote-debugging-port=9222 ^
     --remote-debugging-address=0.0.0.0 ^
     --remote-allow-origins=* ^
-    --user-data-dir=C:\Users\simon\Desktop\channel_promo\chrome-scraping ^
+    --user-data-dir="%USERPROFILE%\chrome-scraping" ^
     --no-first-run ^
     --no-default-browser-check
 
@@ -84,6 +121,7 @@ PROFILE="$HOME/.local/share/chrome-scraping"
 mkdir -p "$PROFILE"
 "$CHROME" \
     --remote-debugging-port=9222 \
+    --remote-debugging-address=0.0.0.0 \
     --remote-allow-origins='*' \
     --user-data-dir="$PROFILE" \
     --no-first-run \
@@ -98,8 +136,9 @@ curl -s http://127.0.0.1:9222/json/version
 | Флаг | Зачем |
 |------|-------|
 | `--remote-debugging-port=9222` | Включает CDP на порту 9222 |
+| `--remote-debugging-address=0.0.0.0` | **Обязательно для Docker** — слушать все интерфейсы |
 | `--remote-allow-origins=*` | **Обязательно** — без него WebSocket вернёт 403 |
-| `--user-data-dir=C:\chrome-scraping` | Изолированный профиль (не трогает личный Chrome) |
+| `--user-data-dir=...` | Изолированный профиль (не трогает личный Chrome) |
 | `--no-first-run` | Пропустить приветствие |
 
 ### 3. Прогреть сессии в Chrome
@@ -114,30 +153,107 @@ https://aliexpress.ru/        — пройти x5sec, если появится
 
 Если увидите капчу — **пройдите вручную**. Chrome **не закрывайте** — он нужен для работы парсера.
 
-### 4. Запуск сервера
+### 4. Узнать IP хоста для Docker
 
-```bash
-python main.py
+**Windows**: адрес хоста для Docker Desktop обычно `192.168.65.254`.
+
+Проверить можно так:
+
+```cmd
+docker compose exec parser cat /etc/hosts | findstr host.docker.internal
 ```
 
-Открыть: http://localhost:8000/docs
+Первая строка с IPv4 — это адрес хоста. Запишите его.
+
+### 5. Настроить `docker-compose.yml`
+
+**Откройте `docker-compose.yml`**, найдите блок `parser` → `environment`:
+
+```yaml
+    environment:
+      CDP_HOST: 192.168.65.254   # ← ваш IP хоста
+      CDP_PORT: 9222
+```
+
+Замените `192.168.65.254` на ваш IP (из шага 4).
+
+### 6. Запустить всё одной командой
+
+```cmd
+docker compose up -d --build
+```
+
+Первый запуск займёт **2–3 минуты** (сборка образов).
+
+### 7. Проверить
+
+```cmd
+docker compose ps
+```
+
+**Ожидаемо:**
+
+```
+NAME                    STATUS              PORTS
+marketplace-frontend    Up                  0.0.0.0:3000->80/tcp
+marketplace-parser      Up (healthy)        0.0.0.0:8000->8000/tcp
+marketplace-postgres    Up (healthy)        5432/tcp
+marketplace-rabbitmq    Up (healthy)        0.0.0.0:5672->5672/tcp, 0.0.0.0:15672->15672/tcp
+marketplace-worker      Up
+```
+
+---
+
+## 🌐 Что доступно
+
+| Сервис | URL | Логин |
+|--------|-----|-------|
+| **Дашборд** | http://localhost:3000 | — |
+| **API + Swagger** | http://localhost:8000/docs | — |
+| **RabbitMQ UI** | http://localhost:15672 | guest / guest |
+| **PostgreSQL** | `localhost:5432` | parser / parser |
+| **Chrome CDP** | http://localhost:9222 | — |
 
 ---
 
 ## 📡 API Endpoints
+
+### Парсинг (синхронно)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `POST` | `/api/v1/parse` | Спарсить URL, вернуть результат сразу |
+
+### Очередь (асинхронно)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `POST` | `/api/v1/queue/enqueue` | Отправить URL в очередь |
+| `POST` | `/api/v1/queue/enqueue-batch` | Отправить список URL |
+| `GET` | `/api/v1/queue/status` | Статус очередей |
+
+### Результаты (для дашборда)
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| `GET` | `/api/v1/results` | Список результатов с фильтрами |
+| `GET` | `/api/v1/results/stats` | Статистика |
+| `GET` | `/api/v1/results/{id}` | Один товар |
+| `DELETE` | `/api/v1/results/{id}` | Удалить товар |
+
+### Служебные
 
 | Метод | Путь | Описание |
 |-------|------|----------|
 | `GET` | `/` | Информация о сервисе |
 | `GET` | `/api/v1/health` | Проверка работоспособности |
 | `GET` | `/api/v1/cdp-check` | Проверка доступности Chrome CDP |
-| `POST` | `/api/v1/parse` | Спарсить товар по URL |
 
 ---
 
 ## 🧪 Примеры запросов
 
-### Ozon
+### Синхронный парсинг (сразу ответ)
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/parse \
@@ -145,41 +261,46 @@ curl -X POST http://localhost:8000/api/v1/parse \
   -d '{"url": "https://www.ozon.ru/product/142701653/"}'
 ```
 
-### Wildberries
+### Асинхронный парсинг (через очередь)
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/parse \
+curl -X POST http://localhost:8000/api/v1/queue/enqueue \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://www.wildberries.ru/catalog/219498821/detail.aspx"}'
+  -d '{"url": "https://www.ozon.ru/product/142701653/"}'
 ```
 
-### AliExpress
+### Batch-отправка
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/parse \
+curl -X POST http://localhost:8000/api/v1/queue/enqueue-batch \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://aliexpress.ru/item/1005008955014882.html"}'
+  -d '{"urls": [
+    "https://www.ozon.ru/product/142701653/",
+    "https://www.wildberries.ru/catalog/219498821/detail.aspx",
+    "https://market.yandex.ru/product/6113276549"
+  ]}'
 ```
 
-### Яндекс карточка
+### Список результатов с фильтрами
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/parse \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://market.yandex.ru/product/6113276549"}'
+# Все товары
+curl http://localhost:8000/api/v1/results
+
+# Только Wildberries
+curl "http://localhost:8000/api/v1/results?marketplace=wildberries"
+
+# Поиск по названию
+curl "http://localhost:8000/api/v1/results?search=масло"
+
+# Диапазон цен
+curl "http://localhost:8000/api/v1/results?min_price=100&max_price=2000"
+
+# Пагинация
+curl "http://localhost:8000/api/v1/results?page=2&per_page=10"
 ```
 
-### Яндекс поиск
-
-```bash
-curl -X POST http://localhost:8000/api/v1/parse \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://market.yandex.ru/search?text=наполнитель+кошачий"}'
-```
-
-### Windows CMD
-
-В CMD JSON передаётся через `\"`:
+### Windows CMD — экранирование кавычек
 
 ```cmd
 curl -X POST http://localhost:8000/api/v1/parse -H "Content-Type: application/json" -d "{\"url\": \"https://www.ozon.ru/product/142701653/\"}"
@@ -191,16 +312,11 @@ curl -X POST http://localhost:8000/api/v1/parse -H "Content-Type: application/js
 -d "{\"url\": \"https://www.ozon.ru/product/123/?at=xxx^&sh=yyy\"}"
 ```
 
-Или используйте файл:
-
-```cmd
-echo {"url": "https://..."} > request.json
-curl -X POST http://localhost:8000/api/v1/parse -H "Content-Type: application/json" -d @request.json
-```
-
 ---
 
 ## 📤 Формат ответа
+
+### `/api/v1/parse` (синхронный)
 
 ```json
 {
@@ -224,11 +340,44 @@ curl -X POST http://localhost:8000/api/v1/parse -H "Content-Type: application/js
 }
 ```
 
+### `/api/v1/results` (с фильтрами)
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "url": "https://www.ozon.ru/product/142701653/",
+      "marketplace": "ozon",
+      "sku": "142701653",
+      "title": "Наполнитель глиняный...",
+      "price_rub": 1147.0,
+      "price_with_plus": 1041.0,
+      "price_original_rub": 1220.0,
+      "seller": "Ozon Россия",
+      "rating": 4.9,
+      "rating_count": 206669,
+      "in_stock": true,
+      "image_url": "https://ir.ozone.ru/s3/multimedia-1-i/7587071586.jpg",
+      "tier_used": "cdp",
+      "post_text": "🔥 **Наполнитель глиняный...**",
+      "success": true,
+      "error": null,
+      "created_at": "2026-09-16T18:42:24.190268Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "per_page": 20,
+  "pages": 1
+}
+```
+
 ### Поля ответа
 
 | Поле | Описание |
 |------|----------|
-| `success` | `true` если товар получен, `false` при ошибке |
+| `success` | `true` если товар получен |
 | `marketplace` | `ozon` / `wildberries` / `aliexpress` / `yandex` |
 | `sku` | Артикул товара |
 | `title` | Название |
@@ -241,13 +390,14 @@ curl -X POST http://localhost:8000/api/v1/parse -H "Content-Type: application/js
 | `rating_count` | Количество оценок |
 | `in_stock` | Есть ли в наличии |
 | `image_url` | Главная картинка товара |
-| `tier_used` | Как получены данные: `cdp` / `cdp_dom` / `ssr` / `ssr_card` |
+| `tier_used` | `cdp` / `cdp_dom` / `ssr` / `ssr_card` |
 | `post_text` | Готовый пост для Telegram |
+| `created_at` | Дата парсинга (UTC ISO-8601) |
 | `error` | Текст ошибки при `success: false` |
 
 ---
 
-## 🛠️ Архитектура
+## 🛠️ Архитектура парсинга
 
 | Маркетплейс | Стратегия | tier_used |
 |-------------|-----------|-----------|
@@ -274,7 +424,7 @@ CDP (Chrome DevTools Protocol) — протокол, через который �
 **Почему это работает:** Cloudflare проверяет TLS-отпечаток и JS-окружение. Chrome — настоящий браузер с настоящим отпечатком, поэтому его пропускают.
 
 **Что важно:**
-- Chrome должен быть запущен с `--remote-allow-origins=*`.
+- Chrome должен быть запущен с `--remote-debugging-address=0.0.0.0` и `--remote-allow-origins=*`.
 - Вкладка маркетплейса должна быть **прогрета** (открыта вручную).
 - Нельзя закрывать Chrome во время работы парсера.
 
@@ -283,10 +433,16 @@ CDP (Chrome DevTools Protocol) — протокол, через который �
 ## 📁 Структура проекта
 
 ```
-marketplace_parser/
+channel_promo/
 ├── main.py                      # Точка входа FastAPI
+├── worker.py                    # Worker: парсит URL + сохраняет в БД
+├── db.py                        # SQLAlchemy модели + функции БД
 ├── requirements.txt
 ├── requirements-test.txt
+├── Dockerfile
+├── docker-compose.yml
+├── start-chrome-cdp.bat         # Запуск Chrome с CDP (Windows)
+├── start-chrome-cdp.sh          # Запуск Chrome с CDP (Linux/macOS)
 ├── README.md
 ├── core/
 │   ├── __init__.py
@@ -304,10 +460,33 @@ marketplace_parser/
 │   └── marketplace.py           # MarketplaceFactory
 ├── routers/
 │   ├── __init__.py
-│   └── parse.py                 # POST /parse, GET /cdp-check
+│   ├── parse.py                 # POST /parse, GET /cdp-check
+│   ├── queue.py                 # POST /enqueue, GET /status
+│   └── results.py               # GET /results (для дашборда)
+├── broker/
+│   ├── __init__.py
+│   ├── connection.py            # Подключение к RabbitMQ
+│   ├── producer.py              # Отправка URL в очередь
+│   ├── consumer.py              # Чтение URL, парсинг, публикация результата
+│   └── storage_consumer.py      # Сохранение результатов в БД
 ├── config/
 │   ├── __init__.py
 │   └── settings.py
+├── frontend/                    # React-дашборд
+│   ├── Dockerfile
+│   ├── nginx.conf
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   ├── index.html
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx
+│       ├── api.ts
+│       └── styles.css
+├── scripts/
+│   ├── read_result.py           # Прочитать один результат из очереди
+│   └── send_urls.py             # Массовая отправка URL
 └── tests/
     ├── conftest.py              # Pytest fixtures
     ├── test_models.py           # Unit: модели
@@ -315,37 +494,60 @@ marketplace_parser/
     ├── test_parsers.py          # Unit: extract_sku
     ├── test_api.py              # Unit: FastAPI
     ├── test_integration.py      # Integration: реальные запросы
-    └── run_all.bat              # Запуск всех тестов
+    ├── test_cdp.py              # Проверка Chrome CDP
+    ├── run_all.bat              # Запуск всех тестов
+    └── smoke_test.bat           # Smoke-тест через curl
 ```
 
 ---
 
 ## ⚙️ Конфигурация
 
-Создайте `.env` в корне:
+Все настройки — через переменные окружения в `docker-compose.yml`.
 
-```bash
-# Chrome CDP
-CDP_HOST=127.0.0.1
-CDP_PORT=9222
+### Основные
 
-# Таймауты (секунды)
-YANDEX_TIMEOUT=40
-OZON_TIMEOUT=30
-WB_TIMEOUT=15
-ALI_TIMEOUT=30
+```yaml
+environment:
+  # Chrome CDP — IP хоста, где запущен Chrome
+  CDP_HOST: 192.168.65.254
+  CDP_PORT: 9222
 
-# Паузы между запросами (rate limiting)
-YANDEX_MIN_GAP=1.5
-OZON_MIN_GAP=2.5
-WB_MIN_GAP=1.5
-ALI_MIN_GAP=3.0
+  # RabbitMQ
+  RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
 
-# Прокси (опционально)
-# OZON_PROXY=http://user:pass@residential-proxy:port
-# YANDEX_PROXY=http://user:pass@residential-proxy:port
-# WB_PROXY=http://user:pass@residential-proxy:port
-# ALI_PROXY=http://user:pass@residential-proxy:port
+  # PostgreSQL
+  DATABASE_URL: postgresql+asyncpg://parser:parser@postgres:5432/parser
+
+  # Логирование
+  LOG_LEVEL: INFO
+```
+
+### Таймауты
+
+```yaml
+  YANDEX_TIMEOUT: 40
+  OZON_TIMEOUT: 30
+  WB_TIMEOUT: 15
+  ALI_TIMEOUT: 30
+```
+
+### Rate limiting
+
+```yaml
+  YANDEX_MIN_GAP: 1.5
+  OZON_MIN_GAP: 2.5
+  WB_MIN_GAP: 1.5
+  ALI_MIN_GAP: 3.0
+```
+
+### Прокси (опционально)
+
+```yaml
+  # OZON_PROXY: http://user:pass@residential-proxy:port
+  # YANDEX_PROXY: http://user:pass@residential-proxy:port
+  # WB_PROXY: http://user:pass@residential-proxy:port
+  # ALI_PROXY: http://user:pass@residential-proxy:port
 ```
 
 ---
@@ -390,10 +592,10 @@ start-chrome-cdp.bat
 - `https://www.wildberries.ru/`
 - `https://aliexpress.ru/`
 
-**Шаг 3.** Запустить сервер:
+**Шаг 3.** Запустить все сервисы:
 
 ```cmd
-python main.py
+docker compose up -d
 ```
 
 **Шаг 4.** Запустить integration-тесты:
@@ -426,7 +628,68 @@ tests\run_all.bat
 tests\smoke_test.bat
 ```
 
-Прогоняет по одному запросу к каждому маркетплейсу и проверяет `"success": true`.
+---
+
+## 🐳 Docker
+
+### Команды
+
+```cmd
+# Запуск
+docker compose up -d
+
+# Сборка с нуля
+docker compose build --no-cache
+
+# Логи
+docker compose logs -f parser
+docker compose logs -f worker
+
+# Перезапуск одного сервиса
+docker compose restart parser
+
+# Остановка
+docker compose down
+
+# Остановка + удаление volumes (БД, RabbitMQ)
+docker compose down -v
+
+# Внутри контейнера
+docker compose exec parser bash
+docker compose exec postgres psql -U parser -d parser
+
+# Статистика
+docker stats
+```
+
+### Проверка БД
+
+```cmd
+# Все товары
+docker compose exec postgres psql -U parser -d parser -c "SELECT id, marketplace, price_rub, LEFT(title, 40) FROM products ORDER BY created_at DESC LIMIT 10;"
+
+# Статистика по маркетплейсам
+docker compose exec postgres psql -U parser -d parser -c "SELECT marketplace, COUNT(*) FROM products GROUP BY marketplace ORDER BY marketplace;"
+
+# Очистить БД
+docker compose exec postgres psql -U parser -d parser -c "TRUNCATE TABLE products RESTART IDENTITY;"
+```
+
+### Проверка очередей
+
+```cmd
+# Состояние очередей
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+
+# Через Management API
+curl -u guest:guest "http://localhost:15672/api/queues?columns=name,messages"
+```
+
+### Чтение результатов из очереди
+
+```cmd
+python scripts\read_result.py
+```
 
 ---
 
@@ -471,28 +734,26 @@ WB иногда отдаёт `HTTP 403` как временный rate-limit. О
 Ozon блокирует датацентровые IP через Cloudflare. Без Chrome CDP вернёт `HTTP 403`.
 
 **Решение:**
-- Запустить Chrome с `--remote-debugging-port=9222`.
+- Запустить Chrome с `--remote-debugging-address=0.0.0.0`.
 - Прогреть `ozon.ru` в этом Chrome.
+
+### Товары без цены
+
+Если товар **закончился** — `price_rub` будет `null`, а `in_stock: false`. Это **не баг**, а правильное поведение: `0` в качестве цены попал бы в «самый дешёвый» и испортил бы сортировку.
 
 ---
 
 ## 🐛 Отладка
 
-### Проверить, что CDP работает
+### Проверить CDP изнутри Docker
 
-```bash
-curl http://127.0.0.1:9222/json/version
+```cmd
+# Chrome доступен
+docker compose exec parser python -c "import httpx; r = httpx.get('http://192.168.65.254:9222/json/version', timeout=3); print(r.status_code); print(r.text[:200])"
+
+# Список вкладок
+docker compose exec parser python -c "import httpx; r = httpx.get('http://192.168.65.254:9222/json/list', timeout=3); print([t['url'] for t in r.json() if t.get('type') == 'page'])"
 ```
-
-Должен вернуться JSON с `Browser` и `webSocketDebuggerUrl`.
-
-### Проверить список вкладок
-
-```bash
-curl http://127.0.0.1:9222/json/list
-```
-
-Найдите вкладки с URL маркетплейсов.
 
 ### Проверить через эндпоинт
 
@@ -505,25 +766,51 @@ curl http://localhost:8000/api/v1/cdp-check
 ```json
 {
   "available": true,
-  "browser": "Chrome/153.0.8010.37",
-  "ws_url": "ws://127.0.0.1:9222/devtools/browser/..."
+  "host": "192.168.65.254",
+  "port": 9222,
+  "browser": "Chrome/153.0.8010.48",
+  "ws_url": "ws://192.168.65.254:9222/devtools/browser/..."
 }
 ```
 
 ### Логи
 
-Сервер пишет логи в консоль (уровень `INFO`). При запросе к маркетплейсам видны строки:
+```bash
+# Все логи
+docker compose logs -f
+
+# Только worker
+docker compose logs -f worker
+
+# Только parser
+docker compose logs -f parser
+```
+
+**В логах worker при парсинге видны строки:**
 
 ```
 ozon.cdp | INFO | Ищу вкладку ozon.ru через /json/list...
 ozon.cdp | INFO | Использую вкладку: id=73A74633...
 ozon.cdp | INFO | WebSocket подключён
 ozon.cdp | INFO | fetch вернул: status=200, body_len=151997
+broker.storage_consumer | INFO | Сохранено в БД: id=1, ozon, Наполнитель глиняный...
 ```
 
 ---
 
 ## 🔧 Устранение неполадок
+
+### `ModuleNotFoundError: No module named 'sqlalchemy'`
+
+**Причина:** образ не пересобран после изменения `requirements.txt`.
+
+**Решение:**
+
+```cmd
+docker compose down
+docker compose build --no-cache parser worker
+docker compose up -d
+```
 
 ### `Handshake status 403` при подключении к WebSocket
 
@@ -533,10 +820,28 @@ ozon.cdp | INFO | fetch вернул: status=200, body_len=151997
 
 ```cmd
 taskkill /F /IM chrome.exe
+timeout /t 3
 start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
     --remote-debugging-port=9222 ^
+    --remote-debugging-address=0.0.0.0 ^
     --remote-allow-origins=* ^
     --user-data-dir=C:\chrome-scraping
+```
+
+### `Network is unreachable` при CDP из Docker
+
+**Причина:** `host.docker.internal` резолвится в IPv6, а Chrome слушает IPv4.
+
+**Решение:** использовать IP хоста напрямую:
+
+```yaml
+CDP_HOST: 192.168.65.254
+```
+
+Узнать IP:
+
+```cmd
+docker compose exec parser cat /etc/hosts | findstr host.docker.internal
 ```
 
 ### `HTTP 403 — Ozon блокирует IP`
@@ -549,86 +854,50 @@ start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
 3. Подождать 10 секунд.
 4. Повторить запрос.
 
-### `CDP fetch failed — не удалось выполнить запрос через Chrome`
-
-**Причина:** `websocket-client` не установлен или вкладка не найдена.
-
-**Решение:**
-
-```bash
-pip install websocket-client
-```
-
-Проверить вкладки:
-
-```bash
-curl http://127.0.0.1:9222/json/list
-```
-
-### `WebSocket recv timeout`
-
-**Причина:** страница в Chrome долго грузится или зависла.
-
-**Решение:**
-1. Открыть вкладку маркетплейса вручную.
-2. Обновить (F5).
-3. Подождать 10 секунд.
-4. Повторить запрос.
-
 ### `empty_product_shell` от Яндекса
 
 **Причина:** Яндекс отдаёт пустой каркас страницы (degraded serving).
 
 **Решение:** использовать карточку вместо поиска, или добавить резидентный прокси.
 
-### `Internal Server Error`
+### Worker постоянно рестартует
 
-**Причина:** ошибка в Python-коде. Смотрите traceback в консоли `python main.py`.
+**Причина:** RabbitMQ ещё не готов принять соединения.
 
-**Частые причины:**
-- Не установлен `websocket-client`.
-- Отступ в Python-коде неверный.
-- В `services/marketplace.py` передаются параметры, которых нет в `__init__` парсера.
+**Решение:** в `broker/connection.py` уже есть retry. Если не помогает — увеличьте `max_retries`:
 
----
-
-## 📊 Сравнение с другими решениями
-
-| Решение | Плюсы | Минусы |
-|---------|-------|--------|
-| **Этот проект** | 5 маркетплейсов, без Selenium, готовый `post_text` | Нужен Chrome CDP для Ozon/WB/AliExpress |
-| **Selenium** | Универсально | Медленно, хрупко, нужен WebDriver |
-| **Playwright** | Мощно | Тяжёлые зависимости, `playwright install` |
-| **scrapy** | Асинхронно | Не работает с JS-сайтами |
-| **Apify / готовые API** | Не надо поддерживать | Платно, зависимость от вендора |
-
----
-
-## 🎁 Бонус: сохранение результатов
-
-Сохранить ответ в файл (чтобы увидеть эмодзи без проблем с CMD):
-
-```bash
-curl -s -X POST http://localhost:8000/api/v1/parse \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://www.ozon.ru/product/142701653/"}' \
-  > result.json
+```python
+async def connect(self, max_retries: int = 30, retry_delay: float = 3.0):
 ```
 
-Открыть в VS Code — увидите правильные 🔥 и 🙈.
+### `Broker не подключён` в `/queue/status`
+
+**Причина:** parser не успел подключиться к RabbitMQ при старте.
+
+**Решение:** перезапустить parser:
+
+```cmd
+docker compose restart parser
+```
 
 ---
 
 ## 📌 Roadmap
 
-Возможные улучшения:
-
-- [ ] **`/api/v1/compare`** — сравнение цен по всем маркетплейсам одним запросом
-- [ ] **`/api/v1/parse-batch`** — пакетная обработка списка URL
-- [ ] **Отзывы** — Ozon, WB, Yandex
-- [ ] **Dockerfile + docker-compose** — для деплоя
-- [ ] **TTL-кэш** — для повторных запросов
-- [ ] **Rate limiting** — защита API
+- [x] **5 маркетплейсов** — Ozon, WB, AliExpress, Yandex × 2
+- [x] **REST API** — FastAPI + Swagger
+- [x] **RabbitMQ** — асинхронная очередь
+- [x] **PostgreSQL** — хранение результатов
+- [x] **Worker** — асинхронный парсинг
+- [x] **React-дашборд** — просмотр результатов
+- [x] **Docker Compose** — 5 контейнеров
+- [x] **Тесты** — 33 (28 unit + 5 integration)
+- [ ] **Telegram-бот** — постит `post_text` в канал
+- [ ] **`/api/v1/compare`** — сравнение цен
+- [ ] **Автообновление дашборда** — SSE/WebSocket
+- [ ] **Экспорт CSV/Excel** — кнопка в дашборде
+- [ ] **Расписание** — APScheduler для регулярного парсинга
+- [ ] **Авторизация** — JWT для дашборда
 - [ ] **GitHub Actions** — CI для тестов
 
 ---
@@ -640,6 +909,8 @@ curl -s -X POST http://localhost:8000/api/v1/parse \
 - **ru-marketplace-mcp** ([github.com/Vladimir-Human](https://github.com/Vladimir-Human/ru-marketplace-mcp)) — архитектура SSR-парсинга Yandex и composer-api Ozon
 - **Chrome DevTools Protocol** — [chromedevtools.github.io/devtools-protocol](https://chromedevtools.github.io/devtools-protocol/)
 - **FastAPI** — [fastapi.tiangolo.com](https://fastapi.tiangolo.com/)
+- **aio-pika** — [aio-pika.readthedocs.io](https://aio-pika.readthedocs.io/)
+- **SQLAlchemy** — [sqlalchemy.org](https://www.sqlalchemy.org/)
 
 ---
 

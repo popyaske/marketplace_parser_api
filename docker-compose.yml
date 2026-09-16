@@ -1,26 +1,36 @@
 services:
-  # ----------------------------------------------------------
-  # RabbitMQ — брокер сообщений
-  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: marketplace-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: parser
+      POSTGRES_PASSWORD: parser
+      POSTGRES_DB: parser
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - parser-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: marketplace-rabbitmq
     restart: unless-stopped
-
     ports:
-      - "5672:5672"      # AMQP
-      - "15672:15672"    # Web UI (http://localhost:15672, guest/guest)
-
+      - "5672:5672"
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
-
     networks:
       - parser-network
-
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 30s
@@ -28,111 +38,69 @@ services:
       retries: 5
       start_period: 30s
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ----------------------------------------------------------
-  # FastAPI-сервер (producer)
-  # ----------------------------------------------------------
   parser:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     container_name: marketplace-parser
     restart: unless-stopped
-
     ports:
       - "8000:8000"
-
     environment:
       CDP_HOST: 192.168.65.254
       CDP_PORT: 9222
-
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-
-      YANDEX_TIMEOUT: 40
-      OZON_TIMEOUT: 30
-      WB_TIMEOUT: 15
-      ALI_TIMEOUT: 30
-
-      YANDEX_MIN_GAP: 1.5
-      OZON_MIN_GAP: 2.5
-      WB_MIN_GAP: 1.5
-      ALI_MIN_GAP: 3.0
-
+      DATABASE_URL: postgresql+asyncpg://parser:parser@postgres:5432/parser
       LOG_LEVEL: INFO
-
     depends_on:
       rabbitmq:
         condition: service_healthy
-
+      postgres:
+        condition: service_healthy
     networks:
       - parser-network
-
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
-
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ----------------------------------------------------------
-  # Worker — читает очередь и парсит URL
-  # ----------------------------------------------------------
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
+    build: .
     container_name: marketplace-worker
     restart: unless-stopped
-
     command: ["python", "worker.py"]
-
+    healthcheck:
+      disable: true
     environment:
       CDP_HOST: 192.168.65.254
       CDP_PORT: 9222
-
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-
-      YANDEX_TIMEOUT: 40
-      OZON_TIMEOUT: 30
-      WB_TIMEOUT: 15
-      ALI_TIMEOUT: 30
-
-      YANDEX_MIN_GAP: 1.5
-      OZON_MIN_GAP: 2.5
-      WB_MIN_GAP: 1.5
-      ALI_MIN_GAP: 3.0
-
+      DATABASE_URL: postgresql+asyncpg://parser:parser@postgres:5432/parser
       LOG_LEVEL: INFO
-
     depends_on:
       rabbitmq:
         condition: service_healthy
-
+      postgres:
+        condition: service_healthy
     networks:
       - parser-network
-
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: marketplace-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - parser
+    networks:
+      - parser-network
 
 networks:
   parser-network:
@@ -140,4 +108,4 @@ networks:
 
 volumes:
   rabbitmq-data:
-    driver: local
+  postgres-data:

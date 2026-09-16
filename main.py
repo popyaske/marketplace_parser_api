@@ -1,7 +1,6 @@
 """Точка входа FastAPI"""
 import logging
 from contextlib import asynccontextmanager
-import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,8 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from config.settings import settings
 from routers.parse import router as parse_router
 from routers.queue import router as queue_router
+from routers.results import router as results_router
 from routers.parse import factory as marketplace_factory
 from broker.connection import broker
+from db import create_tables
 
 
 logging.basicConfig(
@@ -25,12 +26,19 @@ logger = logging.getLogger("app")
 async def lifespan(app: FastAPI):
     logger.info(f"Запуск {settings.APP_NAME} v{settings.VERSION}")
 
-    # Подключаемся к RabbitMQ с retry (не блокируем старт при недоступности)
+    # БД
     try:
-        await asyncio.wait_for(broker.connect(), timeout=60.0)
+        await create_tables()
+        logger.info("Таблицы БД готовы")
+    except Exception as e:
+        logger.warning(f"Не удалось создать таблицы: {e}")
+
+    # RabbitMQ
+    try:
+        await broker.connect()
         logger.info("RabbitMQ подключён")
     except Exception as e:
-        logger.warning(f"RabbitMQ недоступен: {e}. Queue API будет возвращать ошибки.")
+        logger.warning(f"RabbitMQ недоступен: {e}")
 
     yield
 
@@ -45,13 +53,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description=settings.DESCRIPTION,
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,6 +66,7 @@ app.add_middleware(
 
 app.include_router(parse_router)
 app.include_router(queue_router)
+app.include_router(results_router)
 
 
 @app.get("/", tags=["root"])
@@ -67,8 +75,7 @@ async def root():
         "app": settings.APP_NAME,
         "version": settings.VERSION,
         "docs": "/docs",
-        "health": "/api/v1/health",
-        "queue": "/api/v1/queue/status",
+        "dashboard": "/api/v1/results",
     }
 
 
@@ -79,5 +86,4 @@ if __name__ == "__main__":
         host=settings.HOST,
         port=settings.PORT,
         reload=True,
-        log_level=settings.LOG_LEVEL.lower(),
     )

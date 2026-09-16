@@ -35,7 +35,8 @@ Thumbs.db
 .env
 *.log
 *.json
-!requirements.txt
+requirements.txt
+frontend/node_modules/
 
 # Chrome профиль
 chrome-scraping/
