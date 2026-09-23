@@ -1,12 +1,19 @@
 """API эндпоинты для просмотра результатов."""
+from sse_starlette.sse import EventSourceResponse
+from db import get_products_since
+import asyncio
+import json
 from datetime import datetime
 from typing import Optional, List
+import csv
+import io
 
+from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from db import (
-    list_products, get_product, delete_product, get_stats,
+    list_products, get_product, delete_product, get_stats, get_price_history
 )
 
 router = APIRouter(prefix="/api/v1/results", tags=["results"])
@@ -103,3 +110,70 @@ async def delete_result(product_id: int):
     if not ok:
         raise HTTPException(status_code=404, detail="Не найдено")
     return {"success": True}
+
+
+@router.get("/{product_id}/history")
+async def product_price_history(product_id: int, limit: int = 100):
+    """История цен для товара."""
+    history = await get_price_history(product_id, limit)
+    return {
+        "product_id": product_id,
+        "history": [
+            {
+                "price_rub": h.price_rub,
+                "price_original_rub": h.price_original_rub,
+                "in_stock": h.in_stock,
+                "created_at": h.created_at,
+            }
+            for h in history
+        ],
+    }
+
+
+@router.get("/stream")
+async def results_stream():
+    """SSE: новые товары в реальном времени."""
+    async def event_generator():
+        last_id = 0
+        while True:
+            try:
+                products = await get_products_since(last_id)
+                for p in products:
+                    yield {
+                        "event": "product",
+                        "data": json.dumps(
+                            ProductOut.model_validate(p).model_dump(mode="json"),
+                            ensure_ascii=False,
+                        ),
+                    }
+                    last_id = max(last_id, p.id)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+
+    return EventSourceResponse(event_generator())
+
+
+@router.get("/export/csv")
+async def export_csv():
+    """Экспорт всех товаров в CSV."""
+    items, _ = await list_products(per_page=10000)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "marketplace", "sku", "title", "price_rub",
+        "price_original_rub", "seller", "rating", "url", "created_at",
+    ])
+    for p in items:
+        writer.writerow([
+            p.id, p.marketplace, p.sku, p.title, p.price_rub,
+            p.price_original_rub, p.seller, p.rating, p.url, p.created_at,
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=products.csv"},
+    )

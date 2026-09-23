@@ -2,6 +2,10 @@
 import logging
 from contextlib import asynccontextmanager
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,6 +13,7 @@ from config.settings import settings
 from routers.parse import router as parse_router
 from routers.queue import router as queue_router
 from routers.results import router as results_router
+from routers.compare import router as compare_router
 from routers.parse import factory as marketplace_factory
 from broker.connection import broker
 from db import create_tables
@@ -67,7 +72,12 @@ app.add_middleware(
 app.include_router(parse_router)
 app.include_router(queue_router)
 app.include_router(results_router)
+app.include_router(compare_router)
 
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.get("/", tags=["root"])
 async def root():

@@ -10,11 +10,11 @@ RABBITMQ_URL = os.getenv(
 
 # Имена очередей
 QUEUE_INCOMING = "parser.incoming"      # входящие URL
-QUEUE_RESULTS = "parser.results"        # результаты парсинга
+QUEUE_RESULTS_STORAGE = "parser.results.storage"     # ← storage
+QUEUE_RESULTS_TELEGRAM = "parser.results.telegram"   # ← telegram
 QUEUE_ERRORS = "parser.errors"          # ошибки
-
-# Exchange
 EXCHANGE_NAME = "parser"
+EXCHANGE_RESULTS = "parser.results.fanout"           # ← fanout exchange
 
 
 class Broker:
@@ -27,7 +27,7 @@ class Broker:
         self.exchange: Optional[aio_pika.RobustExchange] = None
 
     async def connect(self, max_retries: int = 15, retry_delay: float = 3.0):
-        """Подключиться к RabbitMQ с retry (RabbitMQ может стартовать дольше)."""
+        """Подключиться к RabbitMQ с retry."""
         import asyncio
         last_error = None
 
@@ -36,15 +36,34 @@ class Broker:
                 self.connection = await aio_pika.connect_robust(self.url)
                 self.channel = await self.connection.channel()
 
+                # Основной exchange
                 self.exchange = await self.channel.declare_exchange(
                     EXCHANGE_NAME,
                     aio_pika.ExchangeType.DIRECT,
                     durable=True,
                 )
 
-                for queue_name in (QUEUE_INCOMING, QUEUE_RESULTS, QUEUE_ERRORS):
+                # Fanout exchange для результатов (storage + telegram)
+                results_exchange = await self.channel.declare_exchange(
+                    EXCHANGE_RESULTS,
+                    aio_pika.ExchangeType.FANOUT,
+                    durable=True,
+                )
+
+                # Очереди: incoming и errors (direct)
+                for queue_name in (QUEUE_INCOMING, QUEUE_ERRORS):
                     queue = await self.channel.declare_queue(queue_name, durable=True)
                     await queue.bind(self.exchange, routing_key=queue_name)
+
+                # Очереди результатов (fanout)
+                storage_q = await self.channel.declare_queue(
+                    QUEUE_RESULTS_STORAGE, durable=True
+                )
+                telegram_q = await self.channel.declare_queue(
+                    QUEUE_RESULTS_TELEGRAM, durable=True
+                )
+                await storage_q.bind(results_exchange)
+                await telegram_q.bind(results_exchange)
 
                 return self
             except Exception as e:

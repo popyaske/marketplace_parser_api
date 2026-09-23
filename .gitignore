@@ -37,6 +37,7 @@ Thumbs.db
 *.json
 requirements.txt
 frontend/node_modules/
+photo/
 
 # Chrome профиль
 chrome-scraping/

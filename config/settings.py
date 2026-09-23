@@ -14,6 +14,15 @@ class Settings:
     CDP_HOST: str = os.getenv("CDP_HOST", "127.0.0.1")
     CDP_PORT: int = int(os.getenv("CDP_PORT", "9222"))
 
+    # Автоопределение в Docker
+    @classmethod
+    def _resolve_cdp_host(cls) -> str:
+        """Если в Docker — использовать host.docker.internal."""
+        import os
+        if os.path.exists("/.dockerenv"):
+            return os.getenv("CDP_HOST", "host.docker.internal")
+        return os.getenv("CDP_HOST", "127.0.0.1")
+
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # Таймауты для API-запросов (в секундах)

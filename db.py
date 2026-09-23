@@ -9,12 +9,13 @@ from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    func, select, desc,
+    func, select, desc, UniqueConstraint
 )
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import insert
 
 
 DATABASE_URL = os.getenv(
@@ -31,6 +32,10 @@ class Product(Base):
     """Результат парсинга одного товара."""
 
     __tablename__ = "products"
+
+    __table_args__ = (
+        UniqueConstraint("url", "marketplace", name="uq_url_marketplace"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
@@ -58,6 +63,22 @@ class Product(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Мета
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
+
+class PriceHistory(Base):
+    """История цен — новая запись при каждом парсинге."""
+
+    __tablename__ = "price_history"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    price_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_original_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_with_plus: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    in_stock: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True,
     )
@@ -95,7 +116,7 @@ async def save_product(data: dict) -> int:
     """Сохранить результат парсинга. Возвращает id."""
     session_maker = get_session_maker()
     async with session_maker() as session:
-        product = Product(
+        stmt = insert(Product).values(
             url=data.get("url", ""),
             marketplace=data.get("marketplace", "unknown"),
             sku=data.get("sku"),
@@ -114,10 +135,33 @@ async def save_product(data: dict) -> int:
             success=data.get("success", True),
             error=data.get("error"),
         )
-        session.add(product)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["url", "marketplace"],
+            set_={
+                "price_rub": data.get("price_rub"),
+                "price_with_plus": data.get("price_with_plus"),
+                "price_original_rub": data.get("price_original_rub"),
+                "rating": data.get("rating"),
+                "rating_count": data.get("rating_count"),
+                "in_stock": data.get("in_stock"),
+                "created_at": func.now(),
+            },
+        ).returning(Product.id)
+        result = await session.execute(stmt)
         await session.commit()
-        await session.refresh(product)
-        return product.id
+        product_id = result.scalar_one()
+
+        history = PriceHistory(
+            product_id=product_id,
+            price_rub=data.get("price_rub"),
+            price_original_rub=data.get("price_original_rub"),
+            price_with_plus=data.get("price_with_plus"),
+            in_stock=data.get("in_stock"),
+        )
+        session.add(history)
+        await session.commit()
+
+        return product_id
 
 
 async def list_products(
@@ -201,3 +245,30 @@ async def get_stats() -> dict:
             "by_marketplace": by_marketplace,
             "last_24h": last_24h,
         }
+
+
+async def get_price_history(product_id: int, limit: int = 100) -> List[PriceHistory]:
+    """История цен для одного товара."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            select(PriceHistory)
+            .where(PriceHistory.product_id == product_id)
+            .order_by(desc(PriceHistory.created_at))
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+
+async def get_products_since(last_id: int) -> List[Product]:
+    """Получить товары с id > last_id."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            select(Product)
+            .where(Product.id > last_id)
+            .order_by(Product.id.asc())
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())

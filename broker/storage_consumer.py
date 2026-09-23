@@ -4,20 +4,22 @@ import logging
 
 import aio_pika
 
-from .connection import broker, QUEUE_RESULTS
+from .connection import broker, QUEUE_RESULTS_STORAGE
 from db import save_product
 
 logger = logging.getLogger(__name__)
 
 
 async def run_storage_consumer():
-    """Читает parser.results и сохраняет каждое сообщение в БД."""
+    """Читает parser.results и сохраняет в БД."""
     await broker.connect()
 
-    queue = await broker.channel.declare_queue(QUEUE_RESULTS, durable=True)
-    await broker.channel.set_qos(prefetch_count=10)
+    channel = await broker.connection.channel()
+    await channel.set_qos(prefetch_count=1)
 
-    logger.info(f"Storage consumer запущен, слушает {QUEUE_RESULTS}")
+    queue = await channel.declare_queue(QUEUE_RESULTS_STORAGE, durable=True)
+
+    logger.info(f"Storage consumer запущен, слушает {QUEUE_RESULTS_STORAGE}")
 
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:

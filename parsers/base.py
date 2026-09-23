@@ -2,6 +2,8 @@
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional
+from cachetools import TTLCache
+import hashlib
 
 from core.models import ProductData
 
@@ -18,6 +20,7 @@ class BaseParser(ABC):
 
     marketplace: str = "unknown"
     base_url: str = ""
+    _cache: TTLCache = TTLCache(maxsize=500, ttl=300)
 
     @abstractmethod
     def extract_sku(self, url: str) -> Optional[str]:
@@ -31,3 +34,14 @@ class BaseParser(ABC):
 
     def close(self):
         pass
+
+    def fetch_cached(self, url: str) -> ProductData:
+        """Fetch с TTL-кэшем (5 минут)."""
+        key = hashlib.md5(url.encode()).hexdigest()
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        result = self.fetch(url)
+        if result.success:
+            self._cache[key] = result
+        return result

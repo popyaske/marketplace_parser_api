@@ -59,6 +59,19 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters])
 
+  // SSE автообновление
+  useEffect(() => {
+    const es = new EventSource('/api/v1/results/stream')
+    es.addEventListener('product', (e: MessageEvent) => {
+      try {
+        const product = JSON.parse(e.data)
+        setResults((prev) => [product, ...prev])
+        setTotal((t) => t + 1)
+      } catch {}
+    })
+    return () => es.close()
+  }, [])
+
   const handleEnqueue = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!newUrl.trim()) return

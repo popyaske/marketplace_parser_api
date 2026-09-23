@@ -1,13 +1,17 @@
 """API эндпоинты для работы с очередью."""
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Optional
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from broker.connection import broker
 from broker.producer import send_url
 
 logger = logging.getLogger(__name__)
+limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/api/v1/queue", tags=["queue"])
 
 
@@ -29,7 +33,8 @@ class EnqueueResponse(BaseModel):
 
 
 @router.post("/enqueue", response_model=EnqueueResponse)
-async def enqueue_url(req: EnqueueRequest):
+@limiter.limit("30/minute")
+async def enqueue_url(request: Request, req: EnqueueRequest):
     """
     Добавить URL в очередь на парсинг.
 
@@ -48,7 +53,7 @@ async def enqueue_url(req: EnqueueRequest):
 
 
 @router.post("/enqueue-batch", response_model=EnqueueResponse)
-async def enqueue_batch(req: EnqueueBatchRequest):
+async def enqueue_batch(request: Request, req: EnqueueBatchRequest):
     """Добавить список URL в очередь."""
     try:
         for url in req.urls:

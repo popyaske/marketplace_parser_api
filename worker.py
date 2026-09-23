@@ -19,7 +19,7 @@ logger = logging.getLogger("worker")
 
 async def main():
     logger.info("Запуск воркера...")
-
+    
     # Создаём таблицы (если не существуют)
     try:
         await create_tables()
@@ -29,12 +29,16 @@ async def main():
         await asyncio.sleep(5)
         await create_tables()
 
-    # Запускаем два consumer'а параллельно
+    from worker_health import run_health_server
+    from broker.telegram_consumer import run_telegram_consumer
+
     while True:
         try:
             await asyncio.gather(
-                run_consumer(),           # парсит URL из parser.incoming
-                run_storage_consumer(),   # сохраняет в БД из parser.results
+                run_consumer(),
+                run_storage_consumer(),
+                run_telegram_consumer(),
+                run_health_server(),
             )
         except KeyboardInterrupt:
             logger.info("Остановка воркера")

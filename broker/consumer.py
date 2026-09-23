@@ -9,8 +9,10 @@ import aio_pika
 from .connection import (
     broker,
     QUEUE_INCOMING,
-    QUEUE_RESULTS,
+    QUEUE_RESULTS_STORAGE,
+    QUEUE_RESULTS_TELEGRAM,
     QUEUE_ERRORS,
+    EXCHANGE_RESULTS,
 )
 from services.marketplace import MarketplaceFactory
 from core.formatters import PriceFormatter, TextGenerator
@@ -37,7 +39,7 @@ async def process_url(url: str) -> dict:
         }
 
     try:
-        data = parser.fetch(url)
+        data = parser.fetch_cached(url)
     except Exception as e:
         logger.exception(f"Ошибка парсинга {url}")
         return {
@@ -115,17 +117,33 @@ async def handle_message(message: aio_pika.IncomingMessage):
         result["meta"] = meta
 
         # Публикуем результат
-        queue = QUEUE_RESULTS if result["success"] else QUEUE_ERRORS
-        await broker.publish(queue, result)
-        logger.info(f"Результат опубликован: {queue} — {url}")
+        if result["success"]:
+            # Публикуем в fanout — попадут и storage, и telegram
+            results_exchange = await broker.channel.declare_exchange(
+                EXCHANGE_RESULTS,
+                aio_pika.ExchangeType.FANOUT,
+                durable=True,
+            )
+            import json as _json
+            message = aio_pika.Message(
+                body=_json.dumps(result, ensure_ascii=False).encode(),
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            )
+            await results_exchange.publish(message, routing_key="")
+        else:
+            await broker.publish(QUEUE_ERRORS, result)
 
 
 async def run_consumer():
     """Запустить consumer — бесконечный цикл обработки сообщений."""
-    await broker.connect()  # уже с retry из Патча 1
+    await broker.connect()
 
-    queue = await broker.channel.declare_queue(QUEUE_INCOMING, durable=True)
-    await broker.channel.set_qos(prefetch_count=1)
+    # Создаём ОТДЕЛЬНЫЙ канал для этого consumer'а
+    channel = await broker.connection.channel()
+    await channel.set_qos(prefetch_count=1)
+
+    queue = await channel.declare_queue(QUEUE_INCOMING, durable=True)
 
     logger.info(f"Consumer запущен, слушает {QUEUE_INCOMING}")
 

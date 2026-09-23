@@ -229,21 +229,30 @@ class AliexpressParser(BaseParser):
                 ),
             )
 
-        dom = self._cdp_read_dom(item_id)
-        if dom is None:
-            return ProductData(
-                url=url, marketplace=self.marketplace, sku=item_id, success=False,
-                error="Не удалось прочитать DOM карточки AliExpress.",
-            )
+        dom = None
+        for attempt in range(3):
+            dom = self._cdp_read_dom(item_id)
+            if dom is None:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                return ProductData(
+                    url=url, marketplace=self.marketplace, sku=item_id, success=False,
+                    error="Не удалось прочитать DOM карточки AliExpress.",
+                )
 
-        if dom.get("punish"):
-            return ProductData(
-                url=url, marketplace=self.marketplace, sku=item_id, success=False,
-                error=(
-                    "AliExpress показал x5sec проверку. "
-                    "Откройте aliexpress.ru в Chrome CDP и пройдите проверку вручную."
-                ),
-            )
+            if dom.get("punish"):
+                if attempt < 2:
+                    time.sleep(5)
+                    continue
+                return ProductData(
+                    url=url, marketplace=self.marketplace, sku=item_id, success=False,
+                    error=(
+                        "AliExpress показал x5sec проверку (3 попытки). "
+                        "Откройте aliexpress.ru в Chrome CDP и пройдите проверку вручную."
+                    ),
+                )
+            break
 
         title = dom.get("title")
         if not title:
