@@ -41,6 +41,7 @@ class Product(Base):
 
     # Источник
     url: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    share_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     marketplace: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     sku: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 

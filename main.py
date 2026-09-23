@@ -1,4 +1,5 @@
 """Точка входа FastAPI"""
+import os
 import logging
 from contextlib import asynccontextmanager
 
@@ -31,14 +32,18 @@ logger = logging.getLogger("app")
 async def lifespan(app: FastAPI):
     logger.info(f"Запуск {settings.APP_NAME} v{settings.VERSION}")
 
-    # БД
+    # В тестах не подключаемся к БД/RabbitMQ
+    if os.getenv("TESTING") == "1":
+        logger.info("TESTING=1 — пропускаю подключения к БД и RabbitMQ")
+        yield
+        return
+
     try:
         await create_tables()
         logger.info("Таблицы БД готовы")
     except Exception as e:
         logger.warning(f"Не удалось создать таблицы: {e}")
 
-    # RabbitMQ
     try:
         await broker.connect()
         logger.info("RabbitMQ подключён")

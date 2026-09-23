@@ -13,6 +13,7 @@ CRITICAL: цены НЕ в priceU/salePriceU (они null с Nov 2026).
 """
 
 import math
+import logging
 import re
 import time
 from typing import Any, Optional, List
@@ -24,6 +25,7 @@ import httpx
 from core.models import ProductData
 from .base import BaseParser
 
+logger = logging.getLogger("wildberries")
 
 WB_HEADERS = {
     "User-Agent": (
@@ -154,8 +156,6 @@ class WildberriesParser(BaseParser):
         Использует УЖЕ ОТКРЫТУЮ вкладку wildberries.ru (не создаёт новую).
         Прогрейте её вручную: откройте https://www.wildberries.ru/ в Chrome CDP.
         """
-        import logging
-        logger = logging.getLogger("wb.cdp")
 
         try:
             from websocket import create_connection
@@ -356,10 +356,77 @@ class WildberriesParser(BaseParser):
             rating=p.get("reviewRating"),
             rating_count=_coerce_int(p.get("feedbacks")),
             in_stock=qty is not None and qty > 0 and current is not None,
-            image_url=f"https://basket-01.wbbasket.ru/vol{int(sku)//100000}/part{int(sku)//1000}/{sku}/images/big/1.webp",
+            image_url=_get_wb_image_url(int(sku)),
             success=True,
             tier_used=tier,
         )
 
     def close(self):
         self.client.close()
+
+
+def _fetch_card_json(nm_id: int, timeout: float = 10.0) -> dict:
+    """
+    Скачивает card.json с basket CDN WB.
+    Возвращает dict с полями media/photos или {} при ошибке.
+    """
+    import httpx
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    hosts = [f"basket-{i:02d}.wbbasket.ru" for i in range(1, 29)]  # 28 шардов
+
+    for host in hosts:
+        url = f"https://{host}/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+        try:
+            r = httpx.get(url, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            continue
+    return {}
+
+def _get_wb_image_url(nm_id: int) -> str | None:
+    """
+    Возвращает URL главной картинки товара.
+    Сначала пробует card.json (там готовые URL),
+    потом fallback на ручное построение.
+    """
+    # 1. Пробуем card.json
+    card = _fetch_card_json(nm_id)
+    if card:
+        # Ищем URL в разных возможных полях
+        media = card.get("media") or {}
+        photos = media.get("photos") or []
+
+        # Вариант A: media.photos[0].big
+        if photos and isinstance(photos[0], dict):
+            url = photos[0].get("big") or photos[0].get("c516x688") or photos[0].get("square")
+            if url and url.startswith("http"):
+                return url
+
+        # Вариант B: photo_count + basket host из ответа
+        basket_host = card.get("basket_host") or card.get("host")
+        if basket_host:
+            vol = nm_id // 100000
+            part = nm_id // 1000
+            return f"https://{basket_host}/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
+
+    # 2. Fallback — ручное построение (используем актуальную таблицу)
+    vol = nm_id // 100000
+    table = [
+        (143, "01"), (287, "02"), (431, "03"), (719, "04"),
+        (1007, "05"), (1061, "06"), (1115, "07"), (1169, "08"),
+        (1313, "09"), (1601, "10"), (1655, "11"), (1919, "12"),
+        (2045, "13"), (2189, "14"), (2405, "15"), (2621, "16"),
+        (2837, "17"), (3053, "18"), (3269, "19"), (3485, "20"),
+        (3701, "21"), (3917, "22"), (4133, "23"), (4349, "24"),
+        (4565, "25"), (4781, "26"), (4997, "27"),
+    ]
+    basket_num = "28"
+    for upper, num in table:
+        if vol <= upper:
+            basket_num = num
+            break
+
+    part = nm_id // 1000
+    return f"https://basket-{basket_num}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"

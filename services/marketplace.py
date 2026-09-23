@@ -26,7 +26,7 @@ class MarketplaceFactory:
     }
 
     # Парсеры, которым нужен Chrome CDP
-    CDP_PARSERS = {"ozon", "wildberries", "aliexpress"}
+    CDP_PARSERS = {"ozon", "wildberries", "aliexpress", "yandex"}
 
     def __init__(self):
         self._parsers = {}

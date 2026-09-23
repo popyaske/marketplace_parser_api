@@ -22,6 +22,7 @@ class ProductData:
     price_original_rub: Optional[float] = None  # зачёркнутая цена
     # Метаданные
     url: str = "Не найдено"
+    share_url: Optional[str] = None
     marketplace: str = "unknown"
     sku: Optional[str] = None
     seller: str = ""

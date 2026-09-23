@@ -12,6 +12,7 @@ AliExpress защищён x5sec. Анонимный HTTP получает challe
 """
 
 import json
+import logging
 import re
 import time
 from typing import Optional
@@ -20,6 +21,8 @@ import httpx
 
 from core.models import ProductData
 from .base import BaseParser
+
+logger = logging.getLogger("aliexpress")
 
 
 _ITEM_ID_RE = re.compile(r"/item/(\d{9,})(?:\.html)?")
@@ -66,9 +69,6 @@ class AliexpressParser(BaseParser):
         Если не находит — открывает новую вкладку с карточкой и ждёт загрузки.
         """
         print(f"!!! _cdp_read_dom ВЫЗВАН для item_id={item_id}")
-
-        import logging
-        logger = logging.getLogger("aliexpress.cdp")
 
         try:
             from websocket import create_connection

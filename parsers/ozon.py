@@ -10,10 +10,10 @@ CDP требует запущенного Chrome с --remote-debugging-port=9222
 """
 
 import json
+import logging
 import re
 import time
 import urllib.parse
-import uuid
 from typing import Any, Optional, Dict
 
 import httpx
@@ -21,6 +21,7 @@ import httpx
 from core.models import ProductData
 from .base import BaseParser
 
+logger = logging.getLogger("ozon")
 
 OZON_HEADERS = {
     "User-Agent": (
@@ -179,8 +180,6 @@ class OzonParser(BaseParser):
         ВАЖНО: используем существующую вкладку ozon.ru, а не создаём новую.
         Новая вкладка не успевает загрузить cookies и получает 403.
         """
-        import logging
-        logger = logging.getLogger("ozon.cdp")
 
         try:
             from websocket import create_connection
@@ -307,6 +306,153 @@ class OzonParser(BaseParser):
             except Exception:
                 pass
 
+    def _cdp_read_dom_prices(self, sku: str) -> Optional[Dict[str, Any]]:
+        """
+        Читает цены Ozon прямо из DOM через CDP.
+
+        Извлекает:
+          - price_rub       — обычная цена ("С другими банками")
+          - card_price      — цена с Ozon Card ("С банками")
+          - price_original  — зачёркнутая цена (если есть)
+        """
+
+        try:
+            from websocket import create_connection
+        except ImportError:
+            logger.error("websocket-client не установлен")
+            return None
+
+        ws = None
+        try:
+            # 1. Ищем вкладку ozon.ru
+            tabs = httpx.get(
+                f"http://{self.cdp_host}:{self.cdp_port}/json/list", timeout=5.0
+            ).json()
+            tab = next(
+                (t for t in tabs
+                 if t.get("type") == "page" and "ozon.ru" in t.get("url", "")),
+                None,
+            )
+            if not tab:
+                return None
+
+            # 2. Подключаемся к WebSocket
+            ws = create_connection(tab["webSocketDebuggerUrl"], timeout=self.timeout)
+            msg_id = [0]
+
+            def send(method: str, params: dict | None = None, timeout_s: float = 30.0) -> dict:
+                msg_id[0] += 1
+                current_id = msg_id[0]
+                payload = {"id": current_id, "method": method}
+                if params:
+                    payload["params"] = params
+                ws.send(json.dumps(payload))
+
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    ws.settimeout(max(0.1, deadline - time.monotonic()))
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        return {}
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("id") == current_id:
+                        return data
+                return {}
+
+            send("Runtime.enable")
+
+            # 3. JS для чтения цен из DOM
+            js = r"""
+            (() => {
+                const result = {};
+
+                // Функция для извлечения числа из строки "1 213 ₽"
+                const extractPrice = (text) => {
+                    if (!text) return null;
+                    const digits = text.replace(/[^\d]/g, '');
+                    return digits ? parseInt(digits, 10) : null;
+                };
+
+                // Ищем блок "С банками" (цена с Ozon Card)
+                const cardBlock = document.querySelector('.pdp_b2h');
+                if (cardBlock) {
+                    const cardPriceEl = cardBlock.querySelector('.tsHeadline600Large');
+                    result.card_price = extractPrice(cardPriceEl ? cardPriceEl.textContent : '');
+                }
+
+                // Ищем блок "С другими банками" (обычная цена)
+                const regularBlock = document.querySelector('.pdp_b2i');
+                if (regularBlock) {
+                    const priceEl = regularBlock.querySelector('.tsHeadline500Medium');
+                    result.price = extractPrice(priceEl ? priceEl.textContent : '');
+                }
+
+                // Зачёркнутая цена (если есть) — ищем в разных вариантах
+                const originalSelectors = [
+                    '.pdp_b2d .tsHeadline500Medium',  // Ozon: зачёркнутая цена в старом дизайне
+                    '[class*="oldPrice"]',
+                    '[class*="old-price"]',
+                ];
+                for (const sel of originalSelectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        result.price_original = extractPrice(el.textContent);
+                        if (result.price_original) break;
+                    }
+                }
+
+                // Fallback — ищем везде числа с "₽"
+                if (!result.price && !result.card_price) {
+                    const allPrices = [];
+                    document.querySelectorAll('*').forEach(el => {
+                        if (el.children.length === 0) {
+                            const t = el.textContent.trim();
+                            const m = t.match(/^[\d\s\u00a0]+₽$/);
+                            if (m) {
+                                const n = parseInt(t.replace(/[^\d]/g, ''), 10);
+                                if (n > 0) allPrices.push(n);
+                            }
+                        }
+                    });
+                    // Обычно две цены: [card_price, price] или [price, card_price]
+                    if (allPrices.length >= 2) {
+                        result.card_price = Math.min(...allPrices);
+                        result.price = Math.max(...allPrices);
+                    }
+                }
+
+                return JSON.stringify(result);
+            })()
+            """
+
+            result = send("Runtime.evaluate", {
+                "expression": js,
+                "returnByValue": True,
+            }, timeout_s=30.0)
+
+            value = (result.get("result") or {}).get("result", {}).get("value")
+            if not value:
+                logger.error(f"Пустой ответ DOM: {json.dumps(result)[:300]}")
+                return None
+
+            parsed = json.loads(value)
+            logger.info(f"DOM prices: {parsed}")
+            return parsed
+
+        except Exception as e:
+            logger.exception(f"Ошибка чтения DOM цен: {e}")
+            return None
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
     def fetch(self, url: str) -> ProductData:
         path = self._canonical_product_path(url)
         if not path:
@@ -378,6 +524,17 @@ class OzonParser(BaseParser):
         if not parsed.get("title"):
             return ProductData(url=url, marketplace=self.marketplace, success=False,
                                error="parser_drift — нет title")
+
+        if parsed.get("price") is None or parsed.get("card_price") is None:
+            logger.info(f"API не вернул цены, читаю DOM для SKU={self.extract_sku(url)}")
+            dom_prices = self._cdp_read_dom_prices(self.extract_sku(url))
+            if dom_prices:
+                if parsed.get("price") is None and dom_prices.get("price"):
+                    parsed["price"] = dom_prices["price"]
+                if parsed.get("card_price") is None and dom_prices.get("card_price"):
+                    parsed["card_price"] = dom_prices["card_price"]
+                if parsed.get("price_original") is None and dom_prices.get("price_original"):
+                    parsed["price_original"] = dom_prices["price_original"]
 
         return ProductData(
             title=parsed.get("title") or "Не найдено",
