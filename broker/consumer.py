@@ -39,7 +39,7 @@ async def process_url(url: str) -> dict:
         }
 
     try:
-        data = parser.fetch_cached(url)
+        data = await asyncio.to_thread(parser.fetch_cached, url)
     except Exception as e:
         logger.exception(f"Ошибка парсинга {url}")
         return {

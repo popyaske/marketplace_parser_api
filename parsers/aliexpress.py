@@ -68,12 +68,10 @@ class AliexpressParser(BaseParser):
         Ищет вкладку с URL, содержащим /item/{item_id}.
         Если не находит — открывает новую вкладку с карточкой и ждёт загрузки.
         """
-        print(f"!!! _cdp_read_dom ВЫЗВАН для item_id={item_id}")
 
         try:
             from websocket import create_connection
         except ImportError:
-            print("!!! ОШИБКА: websocket-client не установлен")
             return None
 
         target_url = f"https://aliexpress.ru/item/{item_id}.html"
@@ -89,20 +87,50 @@ class AliexpressParser(BaseParser):
 
             # Если нет — создаём новую
             if not tab:
-                print(f"!!! Вкладка /item/{item_id} не найдена, создаю новую...")
+                logger.info(f"Вкладка /item/{item_id} не найдена, создаю новую...")
                 new_tab = httpx.put(
                     f"http://{self.cdp_host}:{self.cdp_port}/json/new?{target_url}",
                     timeout=10.0,
                 )
                 if new_tab.status_code != 200:
-                    print(f"!!! /json/new вернул HTTP {new_tab.status_code}")
+                    logger.error(f"/json/new вернул HTTP {new_tab.status_code}")
                     return None
-                tab = new_tab.json()
-                print(f"!!! Ждём загрузку 10 сек...")
-                time.sleep(10)
+
+                # Ждём появления вкладки с нужным URL в /json/list
+                tab = None
+                for attempt in range(20):  # до 20 секунд
+                    time.sleep(1.0)
+                    try:
+                        tabs = httpx.get(
+                            f"http://{self.cdp_host}:{self.cdp_port}/json/list",
+                            timeout=5.0,
+                        ).json()
+                    except Exception:
+                        continue
+
+                    candidate = next(
+                        (t for t in tabs
+                         if t.get("type") == "page"
+                         and f"/item/{item_id}" in t.get("url", "")
+                         and t.get("webSocketDebuggerUrl")),
+                        None,
+                    )
+                    if candidate:
+                        tab = candidate
+                        logger.info(f"Вкладка готова после {attempt + 1} сек ожидания")
+                        break
+
+                if not tab:
+                    logger.error(f"Вкладка /item/{item_id} не появилась за 20 сек")
+                    return None
+
+                # Даём странице догрузиться (x5sec, DOM, цены)
+                time.sleep(3.0)
 
             ws_url = tab.get("webSocketDebuggerUrl")
-            logger.info(f"Читаю DOM вкладки: {tab.get('url', '')[:80]}")
+            if not ws_url:
+                logger.error("У вкладки нет webSocketDebuggerUrl")
+                return None
 
             ws = create_connection(ws_url, timeout=self.timeout)
 
@@ -180,8 +208,16 @@ class AliexpressParser(BaseParser):
                 result.price_current = currentPrice;
                 result.price_old = oldPrice;
 
-                const img = document.querySelector('img[src*="aliexpress-media"]');
-                result.image_url = img ? img.src : null;
+                img = document.querySelector('img[src*="aliexpress-media"]');
+                let imageUrl = img ? img.src : null;
+                
+                // Страховка от двойного расширения
+                if (imageUrl) {
+                    imageUrl = imageUrl.replace(/\.(jpg|jpeg|png|webp)\.(jpg|jpeg|png|webp)$/i, '.$2');
+                    // Апгрейд 120x120 → 960x960
+                    imageUrl = imageUrl.replace(/_(\d+x\d+)\.(jpg|jpeg|png|webp)$/i, '_960x960.$2');
+                }
+                result.image_url = imageUrl;
 
                 return JSON.stringify(result);
             })()
@@ -194,16 +230,13 @@ class AliexpressParser(BaseParser):
 
             value = (result.get("result") or {}).get("result", {}).get("value")
             if not value:
-                print(f"!!! Пустой value из JS: {json.dumps(result, ensure_ascii=False)[:500]}")
                 return None
-            print(f"!!! JS вернул: {value[:200]}")
 
             return json.loads(value)
 
 
         except Exception as e:
             import traceback
-            print(f"!!! ИСКЛЮЧЕНИЕ в _cdp_read_dom: {type(e).__name__}: {e}")
             traceback.print_exc()
             return None
         finally:

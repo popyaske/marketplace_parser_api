@@ -1,24 +1,31 @@
 """
-Парсер Wildberries через публичный v4 API.
+Парсер Wildberries (новая схема, работает с ноября 2026).
 
-Endpoints:
-  - https://card.wb.ru/cards/v4/detail?nm={id}&dest=-1257786
+WB закрыл анонимный доступ к card.wb.ru. Теперь API живёт на:
+  https://www.wildberries.ru/__internal/card/cards/v4/detail
 
-CRITICAL: цены НЕ в priceU/salePriceU (они null с Nov 2026).
-Реальные цены — в sizes[0].price.{product, basic} в копейках.
+Требует:
+  - Bearer-токен из localStorage['wbid-oauth-sdk-access-token']
+  - deviceid из localStorage['wbx__sessionID'] ('site_<32hex>')
+  - xinfo-строку параметров из localStorage['geo-data-v1-...'].data.xinfo
+  - Живую залогиненную сессию в Chrome
 
-Обязательные параметры:
-  - dest=-1257786 (Москва) — без него пустые stocks/неверные цены
-  - appType=1, curr=rub, locale=ru, spp=30
+Стратегия:
+  Tier 1: CDP — читает localStorage вкладки wildberries.ru, делает fetch
+  Tier 2: Playwright — то же, но через свежий Chromium (если CDP недоступен)
+
+curl_cffi и httpx больше не работают — анонимный доступ закрыт.
 """
 
-import math
+import concurrent.futures
+import json
 import logging
+import math
 import re
 import time
-from typing import Any, Optional, List
+from functools import lru_cache
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
-import json
 
 import httpx
 
@@ -27,20 +34,24 @@ from .base import BaseParser
 
 logger = logging.getLogger("wildberries")
 
+
 WB_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
     ),
-    "Origin": "https://www.wildberries.ru",
-    "Referer": "https://www.wildberries.ru/",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9",
+    "Origin": "https://www.wildberries.ru",
+    "Referer": "https://www.wildberries.ru/",
 }
 
 
+# ============================================================
+# Утилиты парсинга цен
+# ============================================================
+
 def _kopeck_to_rub(v: Any) -> Optional[float]:
-    """WB integer kopecks -> float rubles."""
     if isinstance(v, bool) or v is None:
         return None
     if isinstance(v, (int, float)):
@@ -61,8 +72,7 @@ def _kopeck_to_rub(v: Any) -> Optional[float]:
     return None
 
 
-def _extract_price_rub(p: dict) -> tuple[Optional[float], Optional[float]]:
-    """(current_rub, original_rub) из sizes[0].price, с fallback на priceU/salePriceU."""
+def _extract_price_rub(p: dict) -> Tuple[Optional[float], Optional[float]]:
     if not isinstance(p, dict):
         return (None, None)
     sizes = p.get("sizes") or []
@@ -85,7 +95,6 @@ def _extract_price_rub(p: dict) -> tuple[Optional[float], Optional[float]]:
 
 
 def _decode_mojibake(s: Any) -> str:
-    """Fix WB double-encoded UTF-8."""
     if not isinstance(s, str):
         return ""
     if not s:
@@ -114,26 +123,68 @@ def _coerce_int(v: Any) -> Optional[int]:
     return None
 
 
+# ============================================================
+# Основной парсер
+# ============================================================
+
 class WildberriesParser(BaseParser):
-    """Парсер Wildberries через card.wb.ru v4"""
+    """Парсер WB через внутренний API с авторизацией."""
 
     marketplace = "wildberries"
     base_url = "https://www.wildberries.ru"
-    default_dest = "-1257786"  # Москва
+    API_BASE = "https://www.wildberries.ru/__internal/card/cards/v4/detail"
 
-    def __init__(self, timeout: float = 15.0, min_gap: float = 1.5, proxy: Optional[str] = None,
-                 cdp_host: str = "127.0.0.1", cdp_port: int = 9222):
+    # Стелс для Playwright
+    STEALTH_INIT_SCRIPT = (
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        "Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU','ru','en']});"
+        "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});"
+    )
+
+    # JS для сбора токенов из localStorage вкладки
+    _JS_COLLECT_CREDS = r"""
+    (() => {
+        const token = localStorage.getItem('wbid-oauth-sdk-access-token');
+        const deviceid = localStorage.getItem('wbx__sessionID');
+        let xinfo = null;
+        // Ключ geo-data-v1-* содержит динамический хэш
+        for (const k of Object.keys(localStorage)) {
+            if (k.startsWith('geo-data-v1-')) {
+                try {
+                    const v = JSON.parse(localStorage.getItem(k));
+                    if (v?.data?.xinfo) { xinfo = v.data.xinfo; break; }
+                } catch (e) {}
+            }
+        }
+        return JSON.stringify({ token, deviceid, xinfo });
+    })()
+    """
+
+    def __init__(
+        self,
+        timeout: float = 30.0,
+        min_gap: float = 1.5,
+        proxy: Optional[str] = None,
+        cdp_host: str = "127.0.0.1",
+        cdp_port: int = 9222,
+        use_playwright: bool = True,
+    ):
         self.timeout = timeout
         self.min_gap = min_gap
         self.cdp_host = cdp_host
         self.cdp_port = cdp_port
+        self.proxy = proxy
+        self.use_playwright = use_playwright
         self._last_request_at = 0.0
-        self.client = httpx.Client(
-            timeout=timeout,
-            headers=WB_HEADERS,
-            follow_redirects=False,
-            proxy=proxy,
-        )
+        self._last_image_url: Optional[str] = None
+
+        # Кэш credentials (token/deviceid/xinfo) — живут 5 минут
+        self._creds_cache: Optional[Dict[str, str]] = None
+        self._creds_cached_at: float = 0.0
+        self._creds_ttl = 300.0
+
+        # httpx нужен только для CDP discovery (не для API)
+        self.client = httpx.Client(timeout=10.0)
 
     def _throttle(self):
         elapsed = time.monotonic() - self._last_request_at
@@ -141,22 +192,34 @@ class WildberriesParser(BaseParser):
             time.sleep(self.min_gap - elapsed)
         self._last_request_at = time.monotonic()
 
+    # -------------------- URL --------------------
+
+    def _build_api_url(self, sku: str, xinfo: str) -> str:
+        """
+        xinfo уже содержит appType, curr, dest, spp, hide_vflags, ab_testing.
+        Добавляем lang, mtype, nm.
+        """
+        extra = urlencode({"lang": "ru", "mtype": "257", "nm": sku})
+        return f"{self.API_BASE}?{xinfo}&{extra}"
+
+    # -------------------- CDP --------------------
+
     def _cdp_available(self) -> bool:
-        """Проверить, что Chrome CDP отвечает."""
         try:
-            r = httpx.get(f"http://{self.cdp_host}:{self.cdp_port}/json/version", timeout=2.0)
+            r = httpx.get(
+                f"http://{self.cdp_host}:{self.cdp_port}/json/version", timeout=2.0
+            )
             return r.status_code == 200
         except Exception:
             return False
 
-    def _cdp_fetch(self, api_url: str) -> Optional[tuple[int, str]]:
+    def _cdp_call(self, api_url: str, sku: str) -> Optional[Tuple[int, str, Optional[str]]]:
         """
-        Fetch через Chrome CDP с существующей вкладки wildberries.ru.
-
-        Использует УЖЕ ОТКРЫТУЮ вкладку wildberries.ru (не создаёт новую).
-        Прогрейте её вручную: откройте https://www.wildberries.ru/ в Chrome CDP.
+        Возвращает (status, body, image_url).
+        image_url ищется двумя способами:
+          1) regex по HTML карточки (быстро)
+          2) навигация на карточку + DOM querySelector (медленнее, но надёжно)
         """
-
         try:
             from websocket import create_connection
         except ImportError:
@@ -165,37 +228,25 @@ class WildberriesParser(BaseParser):
 
         ws = None
         try:
-            # 1. Ищем вкладку wildberries.ru
-            tabs_resp = httpx.get(f"http://{self.cdp_host}:{self.cdp_port}/json/list", timeout=5.0)
-            if tabs_resp.status_code != 200:
-                return None
-            tabs = tabs_resp.json()
+            # Ищем вкладку wildberries.ru
+            tabs = httpx.get(
+                f"http://{self.cdp_host}:{self.cdp_port}/json/list", timeout=5.0
+            ).json()
 
             tab = next(
                 (t for t in tabs
                  if t.get("type") == "page" and "wildberries.ru" in t.get("url", "")),
                 None,
             )
-
             if not tab:
-                logger.info("Вкладка wildberries.ru не найдена, создаю новую...")
-                new_tab = httpx.put(
-                    f"http://{self.cdp_host}:{self.cdp_port}/json/new?https://www.wildberries.ru/",
-                    timeout=10.0,
-                )
-                if new_tab.status_code != 200:
-                    return None
-                tab = new_tab.json()
-                time.sleep(8)
+                logger.warning("CDP: вкладка wildberries.ru не найдена")
+                return None
 
-            ws_url = tab.get("webSocketDebuggerUrl")
-            logger.info(f"CDP вкладка: id={tab.get('id')}, url={tab.get('url', '')[:60]}")
-
-            ws = create_connection(ws_url, timeout=self.timeout)
-
+            ws = create_connection(tab["webSocketDebuggerUrl"], timeout=self.timeout)
             msg_id = [0]
 
-            def send(method: str, params: dict | None = None, timeout_s: float = 60.0) -> dict:
+            def send(method: str, params: Optional[dict] = None,
+                     timeout_s: float = 30.0) -> dict:
                 msg_id[0] += 1
                 current_id = msg_id[0]
                 payload = {"id": current_id, "method": method}
@@ -219,43 +270,80 @@ class WildberriesParser(BaseParser):
                 return {}
 
             send("Runtime.enable")
+            send("Page.enable")
 
-            # 2. Fetch API изнутри страницы wildberries.ru
-            js = f"""
+            # === 1. Собрать credentials ===
+            creds_result = send("Runtime.evaluate", {
+                "expression": self._JS_COLLECT_CREDS,
+                "returnByValue": True,
+            }, timeout_s=10.0)
+
+            creds_raw = ((creds_result.get("result") or {}).get("result") or {}).get("value")
+            if not creds_raw:
+                logger.error("CDP: не удалось получить credentials")
+                return None
+
+            creds = json.loads(creds_raw)
+            token = creds.get("token")
+            deviceid = creds.get("deviceid")
+            xinfo = creds.get("xinfo")
+
+            if not (token and deviceid and xinfo):
+                logger.error("CDP: token/deviceid/xinfo отсутствуют — залогиньтесь в WB")
+                return None
+
+            api_url = self._build_api_url(sku, xinfo)
+            logger.info(f"CDP: token={token[:20]}..., deviceid={deviceid[:20]}...")
+
+            # === 2. Fetch JSON ===
+            referer = f"https://www.wildberries.ru/catalog/{sku}/detail.aspx"
+            fetch_js = f"""
             (async () => {{
                 try {{
-                    const res = await fetch({json.dumps(api_url)}, {{
+                    const r = await fetch({json.dumps(api_url)}, {{
                         credentials: 'include',
                         headers: {{
-                            'Accept': 'application/json',
-                            'Accept-Language': 'ru-RU,ru;q=0.9'
+                            'accept': '*/*',
+                            'accept-language': 'ru-RU,ru;q=0.9',
+                            'authorization': 'Bearer ' + {json.dumps(token)},
+                            'deviceid': {json.dumps(deviceid)},
+                            'referer': {json.dumps(referer)},
+                            'x-requested-with': 'XMLHttpRequest',
+                            'x-spa-version': '14.26.4'
                         }}
                     }});
-                    const text = await res.text();
-                    return JSON.stringify({{status: res.status, text: text}});
+                    const text = await r.text();
+                    return JSON.stringify({{status: r.status, text: text}});
                 }} catch (e) {{
                     return JSON.stringify({{status: 0, text: String(e)}});
                 }}
             }})()
             """
-
             result = send("Runtime.evaluate", {
-                "expression": js,
+                "expression": fetch_js,
                 "awaitPromise": True,
                 "returnByValue": True,
-            }, timeout_s=60.0)
+            }, timeout_s=40.0)
 
-            value = (result.get("result") or {}).get("result", {}).get("value")
+            value = ((result.get("result") or {}).get("result") or {}).get("value")
             if not value:
-                logger.error(f"Пустой ответ CDP: {json.dumps(result)[:300]}")
+                logger.error(f"CDP: пустой ответ: {json.dumps(result)[:300]}")
                 return None
 
             parsed = json.loads(value)
-            logger.info(f"CDP fetch: status={parsed.get('status')}, body_len={len(parsed.get('text', ''))}")
-            return parsed.get("status", 0), parsed.get("text", "")
+            status = parsed.get("status", 0)
+            body = parsed.get("text", "")
+            logger.info(f"CDP fetch: status={status}, body_len={len(body)}")
+
+            if status != 200:
+                return status, body, None
+
+            # === 3. Найти URL картинки ===
+            image_url = self._cdp_find_image(send, sku)
+            return status, body, image_url
 
         except Exception as e:
-            logger.exception(f"Ошибка CDP: {e}")
+            logger.exception(f"CDP ошибка: {e}")
             return None
         finally:
             if ws:
@@ -264,6 +352,182 @@ class WildberriesParser(BaseParser):
                 except Exception:
                     pass
 
+    def _cdp_find_image(self, send, sku: str) -> Optional[str]:
+        """
+        Ищет URL главной картинки товара:
+          1) regex по HTML карточки (без навигации — быстро)
+          2) навигация на карточку + DOM (медленнее, но надёжно)
+        """
+        card_url = f"https://www.wildberries.ru/catalog/{sku}/detail.aspx"
+
+        # === Попытка 1: regex по HTML ===
+        html_js = f"""
+        (async () => {{
+            try {{
+                const r = await fetch({json.dumps(card_url)}, {{credentials: 'include'}});
+                const html = await r.text();
+                const m = html.match(/https:\\/\\/[a-z0-9-]+\\.(geobasket|wbbasket)\\.ru\\/vol\\d+\\/part\\d+\\/\\d+\\/images\\/[^"'\\s)]+/);
+                return m ? m[0] : null;
+            }} catch (e) {{ return null; }}
+        }})()
+        """
+        res = send("Runtime.evaluate", {
+            "expression": html_js,
+            "awaitPromise": True,
+            "returnByValue": True,
+        }, timeout_s=15.0)
+        url = ((res.get("result") or {}).get("result") or {}).get("value")
+        if url:
+            logger.info(f"image (HTML): {url}")
+            return url
+
+        # === Попытка 2: навигация + DOM ===
+        logger.info("image: HTML не дал URL, навигирую на карточку...")
+        send("Page.navigate", {"url": card_url})
+        time.sleep(5)  # ждём рендера SPA
+
+        dom_js = r"""
+        (() => {
+            const selectors = [
+                'img[src*="geobasket"][src*="/images/c516x688/"]',
+                'img[src*="geobasket"][src*="/images/big/"]',
+                'img[src*="geobasket"][src*="/images/"]',
+                'img[src*="wbbasket"][src*="/images/"]',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el && el.src && el.src.startsWith('http')) {
+                    // Апгрейдим размер до big
+                    return el.src.replace(/\/images\/c\d+x\d+\//, '/images/big/');
+                }
+            }
+            return null;
+        })()
+        """
+        res = send("Runtime.evaluate", {
+            "expression": dom_js,
+            "returnByValue": True,
+        }, timeout_s=10.0)
+        url = ((res.get("result") or {}).get("result") or {}).get("value")
+        if url:
+            logger.info(f"image (DOM): {url}")
+        else:
+            logger.warning("image: не найдена ни в HTML, ни в DOM")
+        return url
+
+    # -------------------- Playwright fallback --------------------
+
+    def _playwright_fetch_sync(self, sku: str) -> Optional[Tuple[int, str]]:
+        """Playwright: берём credentials из localStorage и делаем page.request."""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.error("playwright не установлен")
+            return None
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                ctx_kwargs = {
+                    "user_agent": WB_HEADERS["User-Agent"],
+                    "viewport": {"width": 1920, "height": 1080},
+                    "locale": "ru-RU",
+                    "timezone_id": "Europe/Moscow",
+                }
+                if self.proxy:
+                    ctx_kwargs["proxy"] = {"server": self.proxy}
+
+                context = browser.new_context(**ctx_kwargs)
+                page = context.new_page()
+                page.add_init_script(self.STEALTH_INIT_SCRIPT)
+
+                logger.info("Playwright: открываю wildberries.ru...")
+                try:
+                    page.goto(
+                        "https://www.wildberries.ru/",
+                        wait_until="domcontentloaded",
+                        timeout=40000,
+                    )
+                    page.wait_for_timeout(3000)
+                except Exception as e:
+                    logger.warning(f"Playwright: goto упал: {e}")
+
+                # Извлекаем credentials
+                creds = page.evaluate(self._JS_COLLECT_CREDS)
+                if isinstance(creds, str):
+                    creds = json.loads(creds)
+
+                token = creds.get("token")
+                deviceid = creds.get("deviceid")
+                xinfo = creds.get("xinfo")
+
+                if not (token and deviceid and xinfo):
+                    logger.error(
+                        f"Playwright: не хватает credentials "
+                        f"(token={bool(token)}, deviceid={bool(deviceid)}, xinfo={bool(xinfo)}). "
+                        "Залогиньтесь на wildberries.ru."
+                    )
+                    browser.close()
+                    return None
+
+                api_url = self._build_api_url(sku, xinfo)
+                referer = f"https://www.wildberries.ru/catalog/{sku}/detail.aspx"
+
+                logger.info("Playwright: page.request.get к API...")
+                try:
+                    resp = page.request.get(
+                        api_url,
+                        headers={
+                            "accept": "*/*",
+                            "accept-language": "ru-RU,ru;q=0.9",
+                            "authorization": f"Bearer {token}",
+                            "deviceid": deviceid,
+                            "referer": referer,
+                            "x-requested-with": "XMLHttpRequest",
+                            "x-spa-version": "14.26.4",
+                        },
+                        timeout=30000,
+                    )
+                    status = resp.status
+                    text = resp.text()
+                except Exception as e:
+                    err = str(e)
+                    m = re.search(r'←\s*(\d{3})\s', err)
+                    status = int(m.group(1)) if m else 0
+                    text = err
+
+                browser.close()
+                logger.info(f"Playwright fetch: status={status}, body_len={len(text)}")
+                if status == 0:
+                    logger.error(f"Playwright fetch FAILED. Raw: {text[:200]!r}")
+                return status, text
+
+        except Exception as e:
+            logger.exception(f"Playwright ошибка: {e}")
+            return None
+
+    def _playwright_fetch(self, sku: str) -> Optional[Tuple[int, str]]:
+        if not self.use_playwright:
+            return None
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(self._playwright_fetch_sync, sku).result(timeout=120)
+        except concurrent.futures.TimeoutError:
+            logger.error("Playwright: таймаут 120 сек")
+            return None
+        except Exception as e:
+            logger.exception(f"Playwright в потоке упал: {e}")
+            return None
+
+    # -------------------- Public API --------------------
+
     def extract_sku(self, url: str) -> Optional[str]:
         m = re.search(r'/catalog/(\d+)', url)
         return m.group(1) if m else None
@@ -271,74 +535,73 @@ class WildberriesParser(BaseParser):
     def fetch(self, url: str) -> ProductData:
         sku = self.extract_sku(url)
         if not sku:
-            return ProductData(url=url, marketplace=self.marketplace, success=False,
-                               error="Не удалось извлечь SKU из URL")
-
-        params = urlencode({
-            "appType": "1",
-            "curr": "rub",
-            "dest": self.default_dest,
-            "locale": "ru",
-            "spp": "30",
-            "nm": sku,
-        })
-        api_url = f"https://card.wb.ru/cards/v4/detail?{params}"
+            return ProductData(
+                url=url, marketplace=self.marketplace, success=False,
+                error="Не удалось извлечь SKU из URL",
+            )
 
         data = None
         tier = None
 
-        # === Tier 1: httpx ===
-        try:
-            self._throttle()
-            resp = self.client.get(api_url)
-            if resp.status_code == 200 and resp.text and not resp.text.lstrip().startswith("<"):
-                try:
-                    data = resp.json()
-                    tier = "api"
-                except json.JSONDecodeError:
-                    pass
-        except httpx.HTTPError:
-            pass
+        # === Tier 1: CDP с авторизацией ===
+        if self._cdp_available():
+            logger.info("Tier 1 (CDP + auth): пробую...")
+            result = self._cdp_call(None, sku)  # api_url формируется внутри
+            if result:
+                status_code, body, image_url = result
+                if status_code == 200:
+                    try:
+                        data = json.loads(body)
+                        tier = "cdp"
+                        self._last_image_url = image_url
+                        logger.info("Tier 1 (CDP + auth): OK ✨")
+                    except json.JSONDecodeError:
+                        logger.warning("CDP: non-JSON response")
+                else:
+                    logger.warning(f"CDP: HTTP {status_code}")
+        else:
+            logger.info(
+                f"Tier 1 (CDP): недоступен на {self.cdp_host}:{self.cdp_port}"
+            )
 
-        # === Tier 2: CDP (если Tier 1 не сработал) ===
+        # === Tier 2: Playwright fallback ===
+        if data is None and self.use_playwright:
+            logger.info("Tier 2 (Playwright + auth): пробую...")
+            pw_result = self._playwright_fetch(sku)
+            if pw_result:
+                status_code, body = pw_result
+                if status_code == 200:
+                    try:
+                        data = json.loads(body)
+                        tier = "playwright"
+                        logger.info("Tier 2 (Playwright + auth): OK ✨")
+                    except json.JSONDecodeError:
+                        logger.warning("Playwright: non-JSON response")
+                else:
+                    logger.warning(f"Playwright: HTTP {status_code}")
+
+        # === Всё упало ===
         if data is None:
-            if not self._cdp_available():
-                return ProductData(
-                    url=url, marketplace=self.marketplace, success=False,
-                    error=(
-                        "WB HTTP 403 и Chrome CDP не запущен. "
-                        f"Запустите Chrome с --remote-debugging-port={self.cdp_port}, "
-                        "откройте https://www.wildberries.ru/, затем повторите."
-                    ),
-                )
+            return ProductData(
+                url=url, marketplace=self.marketplace, sku=sku, success=False,
+                error=(
+                    "WB недоступен. Проверьте: "
+                    "1) Chrome CDP запущен; "
+                    "2) вы залогинены на wildberries.ru в этом браузере; "
+                    "3) вкладка wildberries.ru открыта."
+                ),
+            )
 
-            cdp_result = self._cdp_fetch(api_url)
-            if cdp_result is None:
-                return ProductData(
-                    url=url, marketplace=self.marketplace, success=False,
-                    error="CDP fetch failed — не удалось выполнить запрос через Chrome.",
-                )
-
-            status_code, body = cdp_result
-            if status_code == 200 and body and not body.lstrip().startswith("<"):
-                try:
-                    data = json.loads(body)
-                    tier = "cdp"
-                except json.JSONDecodeError:
-                    return ProductData(
-                        url=url, marketplace=self.marketplace, success=False,
-                        error="CDP вернул non-JSON.",
-                    )
-            else:
-                return ProductData(
-                    url=url, marketplace=self.marketplace, success=False,
-                    error=f"CDP fetch вернул HTTP {status_code}.",
-                )
-
-        products = data.get("products") or (data.get("data") or {}).get("products") or []
+        products = (
+            data.get("products")
+            or (data.get("data") or {}).get("products")
+            or []
+        )
         if not products:
-            return ProductData(url=url, marketplace=self.marketplace, success=False,
-                               error="Товар не найден")
+            return ProductData(
+                url=url, marketplace=self.marketplace, success=False,
+                error="Товар не найден",
+            )
 
         p = products[0]
         current, original = _extract_price_rub(p)
@@ -356,7 +619,7 @@ class WildberriesParser(BaseParser):
             rating=p.get("reviewRating"),
             rating_count=_coerce_int(p.get("feedbacks")),
             in_stock=qty is not None and qty > 0 and current is not None,
-            image_url=_get_wb_image_url(int(sku)),
+            image_url=self._last_image_url,
             success=True,
             tier_used=tier,
         )
@@ -364,69 +627,3 @@ class WildberriesParser(BaseParser):
     def close(self):
         self.client.close()
 
-
-def _fetch_card_json(nm_id: int, timeout: float = 10.0) -> dict:
-    """
-    Скачивает card.json с basket CDN WB.
-    Возвращает dict с полями media/photos или {} при ошибке.
-    """
-    import httpx
-    vol = nm_id // 100000
-    part = nm_id // 1000
-    hosts = [f"basket-{i:02d}.wbbasket.ru" for i in range(1, 29)]  # 28 шардов
-
-    for host in hosts:
-        url = f"https://{host}/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
-        try:
-            r = httpx.get(url, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            continue
-    return {}
-
-def _get_wb_image_url(nm_id: int) -> str | None:
-    """
-    Возвращает URL главной картинки товара.
-    Сначала пробует card.json (там готовые URL),
-    потом fallback на ручное построение.
-    """
-    # 1. Пробуем card.json
-    card = _fetch_card_json(nm_id)
-    if card:
-        # Ищем URL в разных возможных полях
-        media = card.get("media") or {}
-        photos = media.get("photos") or []
-
-        # Вариант A: media.photos[0].big
-        if photos and isinstance(photos[0], dict):
-            url = photos[0].get("big") or photos[0].get("c516x688") or photos[0].get("square")
-            if url and url.startswith("http"):
-                return url
-
-        # Вариант B: photo_count + basket host из ответа
-        basket_host = card.get("basket_host") or card.get("host")
-        if basket_host:
-            vol = nm_id // 100000
-            part = nm_id // 1000
-            return f"https://{basket_host}/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
-
-    # 2. Fallback — ручное построение (используем актуальную таблицу)
-    vol = nm_id // 100000
-    table = [
-        (143, "01"), (287, "02"), (431, "03"), (719, "04"),
-        (1007, "05"), (1061, "06"), (1115, "07"), (1169, "08"),
-        (1313, "09"), (1601, "10"), (1655, "11"), (1919, "12"),
-        (2045, "13"), (2189, "14"), (2405, "15"), (2621, "16"),
-        (2837, "17"), (3053, "18"), (3269, "19"), (3485, "20"),
-        (3701, "21"), (3917, "22"), (4133, "23"), (4349, "24"),
-        (4565, "25"), (4781, "26"), (4997, "27"),
-    ]
-    basket_num = "28"
-    for upper, num in table:
-        if vol <= upper:
-            basket_num = num
-            break
-
-    part = nm_id // 1000
-    return f"https://basket-{basket_num}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"

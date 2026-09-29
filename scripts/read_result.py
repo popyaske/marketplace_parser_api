@@ -9,7 +9,7 @@ import aio_pika
 async def main():
     conn = await aio_pika.connect_robust("amqp://guest:guest@localhost:5672/")
     ch = await conn.channel()
-    q = await ch.declare_queue("parser.results", durable=True)
+    q = await ch.declare_queue("parser.results.storage", durable=True)
 
     msg = await q.get(timeout=5)
     if msg:

@@ -39,17 +39,17 @@ class TextGenerator:
 
     # Хештеги по маркетплейсам
     HASHTAGS = {
-        "wildberries": "#Wildberries",
-        "ozon": "#Ozon",
-        "yandex": "#ЯндексМаркет",
-        "aliexpress": "#AliExpress",
+        "wildberries": "🟣 #WB",
+        "ozon": "🔵 #Ozon",
+        "yandex": "🔴 #ЯМ",
+        "aliexpress": "🟠 #AliExpress",
     }
 
     TEMPLATE = (
-        "🔥 **{title}**\n\n"
+        "🚨 **{title}**\n\n"
         "{old_price_line}"
-        "Стало: **{discount_price}** 🔥\n\n"
-        "⚠️ Итоговая цена зависит от аккаунта\n\n"
+        "✅ Стало: **{discount_price}**\n\n"
+        "📌 Итоговая цена зависит от аккаунта\n\n"
         "🛒 [Забрать товар]({url})\n\n"
         "💬 [Чат для обсуждений](https://t.me/PromoMP1_chat)"
     )
@@ -111,10 +111,10 @@ class TextGenerator:
 
         # Определяем "Было" и "Стало"
         if price_original and price_rub:
-            old_price_line = f"Было: {price_original}\n"
+            old_price_line = f"❌ Было: {price_original}\n"
             discount_price = price_rub
         elif price_rub and price_plus:
-            old_price_line = f"Было: {price_rub}\n"
+            old_price_line = f"❌ Было: {price_rub}\n"
             discount_price = price_plus
         elif price_rub:
             old_price_line = ""

@@ -29,6 +29,10 @@ class Broker:
     async def connect(self, max_retries: int = 15, retry_delay: float = 3.0):
         """Подключиться к RabbitMQ с retry."""
         import asyncio
+
+        if self.connection is not None and not self.connection.is_closed:
+            return self
+
         last_error = None
 
         for attempt in range(1, max_retries + 1):
@@ -88,9 +92,11 @@ class Broker:
 
     async def close(self):
         """Закрыть соединение."""
-        if self.connection:
+        if self.connection and not self.connection.is_closed:
             await self.connection.close()
-
+            self.connection = None
+            self.channel = None
+            self.exchange = None
 
 # Глобальный инстанс
 broker = Broker()

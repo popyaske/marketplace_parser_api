@@ -38,7 +38,7 @@ async def enqueue_url(request: Request, req: EnqueueRequest):
     """
     Добавить URL в очередь на парсинг.
 
-    Результат парсинга появится в очереди `parser.results`.
+    Результат парсинга появится в очереди `parser.results.storage`.
     """
     try:
         await send_url(req.url, priority=req.priority, meta=req.meta)
@@ -93,7 +93,7 @@ async def queue_status():
                     "connected": True,
                     "queues": {
                         "incoming": queues.get("parser.incoming", 0),
-                        "results": queues.get("parser.results", 0),
+                        "results": queues.get("parser.results.storage", 0),
                         "errors": queues.get("parser.errors", 0),
                     },
                 }

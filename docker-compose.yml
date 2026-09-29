@@ -67,7 +67,9 @@ services:
       - "host.docker.internal:host-gateway"
 
   worker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: marketplace-worker
     restart: unless-stopped
 

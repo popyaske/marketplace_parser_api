@@ -15,7 +15,6 @@ start "" "%CHROME%" ^
     --remote-debugging-address=0.0.0.0 ^
     --remote-allow-origins=* ^
     --user-data-dir=C:\Users\simon\Desktop\channel_promo\chrome-scraping ^
-    --disable-web-security ^
     --no-first-run ^
     --no-default-browser-check
 

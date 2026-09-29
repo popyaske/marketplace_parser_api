@@ -4,7 +4,7 @@
 Модель Product хранит результаты парсинга.
 """
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from sqlalchemy import (
@@ -238,8 +238,8 @@ async def get_stats() -> dict:
         last_24h = (await session.execute(
             select(func.count())
             .select_from(Product)
-            .where(Product.created_at >= func.now() - func.cast("1 day", __import__("sqlalchemy").Interval))
-        )).scalar_one() if False else 0  # упрощённо
+            .where(Product.created_at >= datetime.now(timezone.utc) - timedelta(days=1))
+        )).scalar_one()
 
         return {
             "total": total,

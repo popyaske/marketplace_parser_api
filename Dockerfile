@@ -1,5 +1,6 @@
+# Dockerfile (универсальный)
 # ============================================================
-# Dockerfile для Marketplace Parser API
+# Dockerfile для Marketplace Parser (parser + worker)
 # ============================================================
 FROM python:3.12-slim
 
@@ -9,27 +10,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         && rm -rf /var/lib/apt/lists/*
 
-# Рабочая директория
 WORKDIR /app
 
-# Сначала зависимости (для кэша слоёв)
+# Python-зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir websocket-client
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Playwright + Chromium
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
+RUN chmod -R 755 /ms-playwright
+
+# Код
 COPY . .
 
 # Непривилегированный пользователь
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Порт FastAPI
 EXPOSE 8000
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:8000/api/v1/health || exit 1
-
-# Запуск
+# По умолчанию — parser. Для worker переопределяем CMD в compose.
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
