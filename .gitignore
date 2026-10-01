@@ -38,6 +38,8 @@ Thumbs.db
 requirements.txt
 frontend/node_modules/
 photo/
+earning_platforms.txt
+telegram.txt
 
 # Chrome профиль
 chrome-scraping/

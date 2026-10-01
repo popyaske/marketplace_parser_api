@@ -85,6 +85,36 @@ class PriceHistory(Base):
     )
 
 
+class PublishedProduct(Base):
+    """Товары, уже опубликованные в Telegram из каталога Такпродам.
+    Защита от повторной публикации (дедупликация по takprodam_id)."""
+
+    __tablename__ = "published_products"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    takprodam_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    product_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    marketplace: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tracking_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
+
+class PublishedReferralProduct(Base):
+    """Товары из реферальной программы Яндекс.Маркета, уже опубликованные."""
+
+    __tablename__ = "published_referral_products"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    product_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    referral_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
 # === Engine и сессии ===
 
 _engine: Optional[AsyncEngine] = None
@@ -273,3 +303,73 @@ async def get_products_since(last_id: int) -> List[Product]:
         )
         result = await session.execute(stmt)
         return list(result.scalars().all())
+
+
+async def get_published_ids() -> set[str]:
+    """Все takprodam_id, которые уже были опубликованы."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        result = await session.execute(select(PublishedProduct.takprodam_id))
+        return {row[0] for row in result.all()}
+
+
+async def mark_published(item: dict) -> None:
+    """Отметить товар как опубликованный (идемпотентно)."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            insert(PublishedProduct)
+            .values(
+                takprodam_id=str(item["id"]),
+                product_id=(
+                    str(item.get("product_id"))
+                    if item.get("product_id") is not None
+                    else None
+                ),
+                marketplace=str(item.get("marketplace_title", "unknown")).lower(),
+                title=item.get("title"),
+                tracking_link=item.get("tracking_link"),
+            )
+            .on_conflict_do_nothing(index_elements=["takprodam_id"])
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def get_last_published_at() -> Optional[datetime]:
+    """Время последней публикации (для логов/диагностики)."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        result = await session.execute(
+            select(PublishedProduct.published_at)
+            .order_by(desc(PublishedProduct.published_at))
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_published_referral_ids() -> set[str]:
+    """Все product_id из рефералки Яндекса, уже опубликованные."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        result = await session.execute(select(PublishedReferralProduct.product_id))
+        return {row[0] for row in result.all()}
+
+
+async def mark_referral_published(
+    product_id: str, title: Optional[str], referral_link: Optional[str]
+) -> None:
+    """Отметить товар из рефералки как опубликованный (идемпотентно)."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            insert(PublishedReferralProduct)
+            .values(
+                product_id=str(product_id),
+                title=title,
+                referral_link=referral_link,
+            )
+            .on_conflict_do_nothing(index_elements=["product_id"])
+        )
+        await session.execute(stmt)
+        await session.commit()

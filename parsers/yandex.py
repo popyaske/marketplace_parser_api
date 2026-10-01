@@ -867,6 +867,343 @@ class YandexParser(BaseParser):
                 except Exception:
                     pass
 
+    def _cdp_get_referral_link(
+            self, product_url: str
+    ) -> Optional[tuple[str, str]]:
+        """
+        Получает реферальную ссылку Яндекс.Маркета через модалку «Поделиться».
+
+        Цепочка:
+          1. Ставим перехват navigator.clipboard.writeText + fetch/XHR.
+          2. Кликаем кнопку «Поделиться» (по data-* или aria-label).
+          3. Ждём появления модалки (data-auto="modal").
+          4. Кликаем «Копировать ссылку» (data-zone-name="copyLinkButton").
+          5. Возвращаем перехваченный URL.
+        """
+        try:
+            from websocket import create_connection
+        except ImportError:
+            log.error("websocket-client не установлен")
+            return None
+
+        ws = None
+        try:
+            tabs = httpx.get(
+                f"http://{self.cdp_host}:{self.cdp_port}/json/list", timeout=5.0
+            ).json()
+            tab = next(
+                (t for t in tabs
+                 if t.get("type") == "page" and _YANDEX_DOMAIN in (t.get("url") or "")),
+                None,
+            )
+            if not tab:
+                log.warning("CDP: вкладка market.yandex.ru не найдена")
+                return None
+
+            ws = create_connection(tab["webSocketDebuggerUrl"], timeout=self.timeout)
+            msg_id = [0]
+
+            def send(method: str, params: Optional[dict] = None,
+                     timeout_s: float = 30.0) -> dict:
+                msg_id[0] += 1
+                current_id = msg_id[0]
+                payload = {"id": current_id, "method": method}
+                if params:
+                    payload["params"] = params
+                ws.send(json.dumps(payload))
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    ws.settimeout(max(0.1, deadline - time.monotonic()))
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        return {}
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("id") == current_id:
+                        return data
+                return {}
+
+            def evaluate(expr: str, await_promise: bool = False,
+                         timeout_s: float = 20.0) -> Any:
+                params: dict = {"expression": expr, "returnByValue": True}
+                if await_promise:
+                    params["awaitPromise"] = True
+                res = send("Runtime.evaluate", params, timeout_s=timeout_s)
+                return (res.get("result") or {}).get("result", {}).get("value")
+
+            send("Runtime.enable")
+            send("Page.enable")
+
+            log.info("CDP: перехожу на %s", product_url[:100])
+            send("Page.navigate", {"url": product_url}, timeout_s=10.0)
+
+            start = time.monotonic()
+            while time.monotonic() - start < 20:
+                ready = evaluate(
+                    "document.readyState === 'complete' && !!document.querySelector('h1')",
+                    timeout_s=3.0,
+                )
+                if ready:
+                    break
+                time.sleep(0.5)
+            time.sleep(2.0)
+
+            # === 1. Ставим перехватчики ===
+            evaluate(r"""
+            (() => {
+                if (window.__shareHookInstalled) return 'already';
+                window.__shareHookInstalled = true;
+                window.__capturedShareLink = null;
+                window.__shareApiResponse = null;
+
+                // Перехват navigator.clipboard.writeText
+                try {
+                    const origWrite = navigator.clipboard.writeText.bind(navigator.clipboard);
+                    navigator.clipboard.writeText = async (text) => {
+                        window.__capturedShareLink = text;
+                        try { return await origWrite(text); } catch (e) { return; }
+                    };
+                } catch (e) {}
+
+                // Перехват fetch
+                const origFetch = window.fetch.bind(window);
+                window.fetch = async (...args) => {
+                    const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                    const resp = await origFetch(...args);
+                    if (url.includes('Referral/sharingPopup')) {
+                        try {
+                            window.__shareApiResponse = await resp.clone().json();
+                        } catch (e) {
+                            window.__shareApiResponse = { error: String(e) };
+                        }
+                    }
+                    return resp;
+                };
+
+                // Перехват XHR
+                const origOpen = XMLHttpRequest.prototype.open;
+                const origSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function (m, u, ...r) {
+                    this.__url = u;
+                    return origOpen.call(this, m, u, ...r);
+                };
+                XMLHttpRequest.prototype.send = function (...a) {
+                    this.addEventListener('load', function () {
+                        if ((this.__url || '').includes('Referral/sharingPopup')) {
+                            try {
+                                window.__shareApiResponse = JSON.parse(this.responseText);
+                            } catch (e) {
+                                window.__shareApiResponse = { error: String(e) };
+                            }
+                        }
+                    });
+                    return origSend.apply(this, a);
+                };
+                return 'ok';
+            })()
+            """, timeout_s=5.0)
+
+            # === 2. Клик по «Поделиться» ===
+            # Ищем по data-zone-name / data-baobab-name / aria-label / тексту
+            js_click_share = r"""
+            (() => {
+                const findShareBtn = () => {
+                    // По data-* с share / sharing
+                    for (const el of document.querySelectorAll('*')) {
+                        const zn = (el.getAttribute('data-zone-name') || '').toLowerCase();
+                        const bn = (el.getAttribute('data-baobab-name') || '').toLowerCase();
+                        const dn = (el.getAttribute('data-node-id') || '').toLowerCase();
+                        const all = zn + ' ' + bn + ' ' + dn;
+                        if (all.includes('share') || all.includes('sharing')) {
+                            const c = el.closest('button, a, [role="button"]')
+                                   || el.querySelector('button, a, [role="button"]')
+                                   || el;
+                            if (c.offsetParent !== null) return c;
+                        }
+                    }
+                    // По aria-label
+                    for (const el of document.querySelectorAll('[aria-label]')) {
+                        const l = (el.getAttribute('aria-label') || '').toLowerCase();
+                        if (l.includes('подел') || l.includes('share')) {
+                            const c = el.closest('button, a, [role="button"]') || el;
+                            if (c.offsetParent !== null) return c;
+                        }
+                    }
+                    // По тексту
+                    for (const el of document.querySelectorAll('button, a, [role="button"], span')) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t === 'поделиться' && el.offsetParent !== null) return el;
+                    }
+                    return null;
+                };
+                const btn = findShareBtn();
+                if (!btn) return 'no_button';
+                btn.scrollIntoView({block: 'center'});
+                btn.click();
+                return 'clicked';
+            })()
+            """
+
+            clicked = False
+            for attempt in range(10):
+                status = evaluate(js_click_share, timeout_s=5.0)
+                if status == "clicked":
+                    clicked = True
+                    log.info("CDP: кнопка «Поделиться» кликнута (попытка %d)", attempt + 1)
+                    break
+                time.sleep(0.5)
+
+            if not clicked:
+                log.warning("CDP: кнопка «Поделиться» не найдена за 5 сек")
+                return None
+
+            # === 3. Ждём появления модалки + кликаем «Копировать ссылку» ===
+            js_wait_and_copy = r"""
+            (() => {
+                // 1. Приоритет: data-zone-name="copyLinkButton" (как в HTML модалки)
+                let btn = document.querySelector('[data-zone-name="copyLinkButton"] button');
+                if (!btn) btn = document.querySelector('[data-zone-name="copyLinkButton"]');
+                // 2. data-baobab-name
+                if (!btn) btn = document.querySelector('[data-baobab-name="copyLinkButton"] button');
+                // 3. По тексту — где угодно в DOM
+                if (!btn) {
+                    for (const el of document.querySelectorAll('button, [role="button"]')) {
+                        const t = (el.textContent || '').trim().toLowerCase();
+                        if (t.includes('копировать ссылку')) { btn = el; break; }
+                    }
+                }
+                if (!btn) return 'no_button_yet';
+                if (btn.offsetParent === null) return 'hidden_button';
+                btn.scrollIntoView({block: 'center'});
+                btn.click();
+                return 'copied_clicked';
+            })()
+            """
+
+            copy_clicked = False
+            last_status = None
+            deadline = time.monotonic() + 25.0  # было 15 → 25
+            while time.monotonic() < deadline:
+                status = evaluate(js_wait_and_copy, timeout_s=5.0)
+                last_status = status
+                if status == "copied_clicked":
+                    copy_clicked = True
+                    log.info("CDP: клик по «Копировать ссылку» выполнен")
+                    break
+                time.sleep(0.5)
+
+            if not copy_clicked:
+                # Диагностика: что реально в DOM после клика «Поделиться»
+                diag = evaluate(r"""
+                        (() => {
+                            const modal = document.querySelector('[data-auto="modal"]');
+                            const hasReferralReward = !!document.querySelector('[data-baobab-name="referralReward"]');
+                            const hasCopyLink = !!document.querySelector('[data-zone-name="copyLinkButton"]');
+                            const modalText = modal ? (modal.textContent || '').slice(0, 300) : '';
+                            return JSON.stringify({
+                                modal_present: !!modal,
+                                referral_reward: hasReferralReward,
+                                copy_link_btn: hasCopyLink,
+                                last_status: document.__lastStatus || null,
+                                modal_text: modalText
+                            });
+                        })()
+                        """, timeout_s=5.0)
+                log.warning("CDP: кнопка «Копировать ссылку» не появилась за 25 сек. "
+                            "status=%s, диагностика=%s", last_status, diag)
+
+                try:
+                    shot = send("Page.captureScreenshot", {"format": "png"}, timeout_s=10.0)
+                    b64 = (shot.get("result") or {}).get("data")
+                    if b64:
+                        import base64
+                        path = f"/tmp/yandex_fail_123.png"
+                        with open(path, "wb") as f:
+                            f.write(base64.b64decode(b64))
+                        log.warning("CDP: скриншот сохранён в %s", path)
+                except Exception as e:
+                    log.debug("CDP: скриншот не удался: %s", e)
+
+            # === 4. Ждём ссылку в перехвате или в API-ответе ===
+            link = None
+            for _ in range(20):  # до 10 сек
+                time.sleep(0.5)
+
+                # 4.1 Из буфера
+                captured = evaluate(
+                    "window.__capturedShareLink || null",
+                    timeout_s=5.0,
+                )
+                if captured and isinstance(captured, str) and _is_referral_url(captured):
+                    link = captured.strip()
+                    log.info("CDP: ссылка из clipboard: %s", link[:120])
+                    break
+
+                # 4.2 Из ответа API
+                raw = evaluate(
+                    "JSON.stringify(window.__shareApiResponse || null)",
+                    timeout_s=5.0,
+                )
+                if raw and raw != "null":
+                    try:
+                        data = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(data, dict):
+                            link = _extract_url_from_share_response(data)
+                            if link:
+                                log.info("CDP: ссылка из API: %s", link[:120])
+                                break
+                    except Exception:
+                        pass
+
+                # 4.3 Из DOM shortUrl
+                dom_raw = evaluate(
+                    r"""
+                    (() => {
+                        const el = document.querySelector('[id*="shortUrl"]');
+                        if (!el) return null;
+                        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                            return el.value || null;
+                        }
+                        return (el.textContent || '').trim() || null;
+                    })()
+                    """,
+                    timeout_s=5.0,
+                )
+                if dom_raw and isinstance(dom_raw, str):
+                    got = _extract_url_from_dom_widget(dom_raw)
+                    if got:
+                        link = got
+                        log.info("CDP: ссылка из DOM: %s", link[:120])
+                        break
+
+            if link:
+                # Закрываем модалку — вежливо
+                evaluate(r"""
+                (() => {
+                    const close = document.querySelector('[aria-label="Закрыть"]')
+                               || document.querySelector('[data-auto="modal"] [class*="close"]');
+                    if (close) close.click();
+                })()
+                """, timeout_s=3.0)
+                html = _grab_outer_html(evaluate)
+                return link.strip(), html
+
+            log.warning("CDP: реферальная ссылка не получена")
+            return None
+
+        except Exception as e:
+            log.exception("CDP ошибка при получении реферальной ссылки: %s", e)
+            return None
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
     # ---------- Разбор HTML ----------
 
     def _build_from_html(self, url: str, html: str, tier: str) -> ProductData:
@@ -1012,3 +1349,153 @@ class YandexParser(BaseParser):
 
     def close(self):
         self.client.close()
+
+
+def _grab_outer_html(evaluate) -> str:
+    """
+    Возвращает outerHTML карточки (или пустую строку).
+    `evaluate` — замыкание из _cdp_get_referral_link, умеющее
+    выполнять JS в текущей вкладке.
+    """
+    try:
+        html = evaluate(
+            "document.documentElement.outerHTML",
+            timeout_s=15.0,
+        )
+        if isinstance(html, str) and html:
+            log.info("CDP: outerHTML карточки size=%d", len(html))
+            return html
+    except Exception as e:
+        log.warning("CDP: не удалось получить outerHTML: %s", e)
+    return ""
+
+
+def _extract_url_from_share_response(data: dict) -> Optional[str]:
+    """Ответ API sharingPopup → ссылка."""
+    if not isinstance(data, dict):
+        return None
+    return _deep_find_url(data)
+
+
+def _extract_url_from_dom_widget(text: str) -> Optional[str]:
+    """
+    DOM-элемент #/content/page/content/defaultPage/shortUrl содержит JSON-виджет.
+    Парсим JSON и ищем именно реферальную ссылку.
+    """
+    if not text:
+        return None
+
+    # Если это уже чистый URL
+    if text.startswith("http") and _is_referral_url(text):
+        return text.strip()
+
+    # Выделяем JSON
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        json_str = text[start:end + 1]
+        try:
+            data = json.loads(json_str)
+            url = _deep_find_url(data)
+            if url:
+                return _normalize_yandex_url(url)
+        except json.JSONDecodeError:
+            pass
+
+    # Regex-фолбэк: ищем конкретно /cc/xxxxx или /referral
+    import re as _re
+    m = _re.search(
+        r'https://market\.yandex\.ru/(?:cc|referral)/[A-Za-z0-9_\-]+',
+        text,
+    )
+    if m:
+        return m.group(0)
+
+    m = _re.search(r'"(?:shortUrl|referralUrl|url)"\s*:\s*"(https?://[^"]+)"', text)
+    if m and _is_referral_url(m.group(1)):
+        return _normalize_yandex_url(m.group(1))
+
+    return None
+
+
+# Домены/пути, которые НЕ являются реферальной ссылкой
+_URL_BLACKLIST_SUBSTR = (
+    "avatars.mds.yandex.net",
+    "get-mpic",
+    "get-marketcms",
+    "yastatic.net",
+    "/images/",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".svg",
+    ".gif",
+)
+
+
+def _is_referral_url(url: str) -> bool:
+    """Является ли ссылка реферальной (а не картинкой/служебной)."""
+    if not isinstance(url, str) or not url.startswith("http"):
+        return False
+    low = url.lower()
+    if any(bad in low for bad in _URL_BLACKLIST_SUBSTR):
+        return False
+    if "market.yandex.ru" not in low and "yandex.ru/cc/" not in low:
+        return False
+    # Признаки реферальной ссылки
+    return (
+        "/cc/" in low
+        or "/referral" in low
+        or "utm_medium=sharing" in low
+        or "utm_referral" in low
+    )
+
+
+def _deep_find_url(obj, depth: int = 0) -> Optional[str]:
+    """
+    Рекурсивно ищет ссылку. Приоритет:
+      1. Явные поля (shortUrl, referralUrl, link) с реферальным признаком.
+      2. Любая ссылка, проходящая _is_referral_url.
+      3. Ничего (чтобы не поймать картинку).
+    """
+    if depth > 8:
+        return None
+
+    if isinstance(obj, str):
+        return obj if _is_referral_url(obj) else None
+
+    if isinstance(obj, dict):
+        # 1. Приоритетные поля
+        for key in ("shortUrl", "referralUrl", "referral_url", "short_url",
+                    "url", "link", "value"):
+            v = obj.get(key)
+            if isinstance(v, str) and _is_referral_url(v):
+                return v
+        # 2. Рекурсия
+        for v in obj.values():
+            r = _deep_find_url(v, depth + 1)
+            if r:
+                return r
+
+    if isinstance(obj, list):
+        for v in obj:
+            r = _deep_find_url(v, depth + 1)
+            if r:
+                return r
+
+    return None
+
+
+def _normalize_yandex_url(url: str) -> str:
+    """Если ссылка относительная — превращаем в абсолютную."""
+    if not url:
+        return url
+    url = url.strip()
+    if url.startswith("http"):
+        return url
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("/"):
+        return "https://market.yandex.ru" + url
+    return url
