@@ -101,6 +101,18 @@ services:
       PUBLISH_HOUR: ${PUBLISH_HOUR:-20}
       PUBLISH_TZ_OFFSET: ${PUBLISH_TZ_OFFSET:-3}
       YANDEX_REFERRAL_INTERVAL: ${YANDEX_REFERRAL_INTERVAL:-600}
+      MEDIA_ROOT: /app/media
+      VK_ACCESS_TOKEN: ${VK_ACCESS_TOKEN:-}
+      VK_USER_ID: ${VK_USER_ID:-0}
+      VK_DIGEST_INTERVAL: ${VK_DIGEST_INTERVAL:-86400}
+      VK_PHOTOS_PER_VIDEO: ${VK_PHOTOS_PER_VIDEO:-5}
+      VK_PHOTO_DURATION: ${VK_PHOTO_DURATION:-3.0}
+      VK_VIDEO_WIDTH: ${VK_VIDEO_WIDTH:-1080}
+      VK_VIDEO_HEIGHT: ${VK_VIDEO_HEIGHT:-1920}
+      VK_USE_POPULAR_MUSIC: ${VK_USE_POPULAR_MUSIC:-1}
+      VK_HASHTAGS: ${VK_HASHTAGS:-#скидки,#маркетплейсы,#промокоды}
+      VK_HASHTAGS_COUNT: ${VK_HASHTAGS_COUNT:-3}
+      VK_CHANNEL_LINK: ${VK_CHANNEL_LINK:-https://t.me/PromoMP1}
 
     depends_on:
       rabbitmq:
@@ -111,6 +123,8 @@ services:
       - parser-network
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - media-data:/app/media
 
   frontend:
     build:
@@ -132,3 +146,4 @@ networks:
 volumes:
   rabbitmq-data:
   postgres-data:
+  media-data:

@@ -9,7 +9,7 @@ from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    func, select, desc, UniqueConstraint
+    func, select, desc, UniqueConstraint, update, delete
 )
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
@@ -112,6 +112,44 @@ class PublishedReferralProduct(Base):
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     referral_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
+
+class PublishedMedia(Base):
+    """Фото, опубликованные в Telegram — источник для VK-видео."""
+
+    __tablename__ = "published_media"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    product_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    post_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    image_path: Mapped[str] = mapped_column(Text, nullable=False)
+    image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    video_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
+
+class PublishedVideo(Base):
+    """Собранные видео/клипы для VK."""
+
+    __tablename__ = "published_videos"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    photo_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    duration_sec: Mapped[float] = mapped_column(Float, nullable=False)
+    vk_owner_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    vk_video_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    vk_post_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="created", index=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True,
     )
 
@@ -373,3 +411,104 @@ async def mark_referral_published(
         )
         await session.execute(stmt)
         await session.commit()
+
+
+async def save_media(
+    source: str,
+    image_path: str,
+    title: Optional[str] = None,
+    price_rub: Optional[float] = None,
+    post_text: Optional[str] = None,
+    image_url: Optional[str] = None,
+    product_id: Optional[int] = None,
+) -> int:
+    """Сохранить факт публикации фото."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        media = PublishedMedia(
+            source=source,
+            product_id=product_id,
+            title=title,
+            price_rub=price_rub,
+            post_text=post_text,
+            image_path=image_path,
+            image_url=image_url,
+        )
+        session.add(media)
+        await session.commit()
+        await session.refresh(media)
+        return media.id
+
+
+async def get_unused_media(limit: int = 5) -> List[PublishedMedia]:
+    """Фото, ещё не вошедшие ни в одно видео."""
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            select(PublishedMedia)
+            .where(PublishedMedia.video_id.is_(None))
+            .order_by(PublishedMedia.created_at.asc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+
+async def create_published_video(
+    file_path: str,
+    photo_count: int,
+    duration_sec: float,
+    status: str = "created",
+) -> PublishedVideo:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        video = PublishedVideo(
+            file_path=file_path,
+            photo_count=photo_count,
+            duration_sec=duration_sec,
+            status=status,
+        )
+        session.add(video)
+        await session.commit()
+        await session.refresh(video)
+        return video
+
+
+async def update_published_video(video_id: int, **fields) -> None:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        video = await session.get(PublishedVideo, video_id)
+        if video is None:
+            return
+        for k, v in fields.items():
+            setattr(video, k, v)
+        await session.commit()
+
+
+async def mark_media_as_used(video_id: int, media_ids: List[int]) -> None:
+    if not media_ids:
+        return
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = (
+            update(PublishedMedia)
+            .where(PublishedMedia.id.in_(media_ids))
+            .values(video_id=video_id)
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+
+async def cleanup_old_media(days: int = 30) -> int:
+    """Удаляет записи о медиа старше N дней."""
+    session_maker = get_session_maker()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    async with session_maker() as session:
+        stmt = (
+            delete(PublishedMedia)
+            .where(PublishedMedia.created_at < cutoff)
+            .where(PublishedMedia.video_id.isnot(None))
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        return result.rowcount or 0

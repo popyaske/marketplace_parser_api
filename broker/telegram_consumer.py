@@ -12,6 +12,8 @@ from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
 
 from .connection import broker, QUEUE_RESULTS_TELEGRAM
+from services.media_storage import save_photo
+from db import save_media
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,21 @@ async def run_telegram_consumer():
                         # Скачиваем картинку и отправляем как файл
                         img_bytes = await _download_image(image_url)
                         if img_bytes:
+                            # Сохраняем фото для будущего VK-клипа
+                            try:
+                                local_path = save_photo(img_bytes, image_url, source="telegram_consumer")
+                                if local_path:
+                                    await save_media(
+                                        source="telegram_consumer",
+                                        image_path=local_path,
+                                        title=data.get("title"),
+                                        price_rub=data.get("price_rub"),
+                                        post_text=post_text,
+                                        image_url=image_url,
+                                    )
+                            except Exception as e:
+                                logger.warning(f"Не удалось сохранить фото для VK: {e}")
+
                             try:
                                 await bot.send_photo(
                                     chat_id=TELEGRAM_CHANNEL_ID,

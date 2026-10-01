@@ -6,6 +6,7 @@ import sys
 
 from broker.consumer import run_consumer
 from broker.daily_publisher import run_daily_publisher
+from broker.vk_digest_publisher import run_vk_digest_publisher
 from broker.yandex_referral_publisher import run_yandex_referral_publisher
 from broker.storage_consumer import run_storage_consumer
 from db import create_tables
@@ -43,6 +44,7 @@ async def main():
                 run_health_server(),
                 #run_daily_publisher(),
                 run_yandex_referral_publisher(),
+                run_vk_digest_publisher(),
             )
         except KeyboardInterrupt:
             logger.info("Остановка воркера")

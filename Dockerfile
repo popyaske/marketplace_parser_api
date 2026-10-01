@@ -8,6 +8,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
+        ffmpeg \
         && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -24,8 +25,11 @@ RUN chmod -R 755 /ms-playwright
 # Код
 COPY . .
 
-# Непривилегированный пользователь
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+# Непривилегированный пользователь + каталоги медиа
+RUN useradd -m -u 1000 appuser \
+    && mkdir -p /app/media/photos /app/media/videos /app/media/music \
+    && chown -R appuser:appuser /app
+
 USER appuser
 
 EXPOSE 8000

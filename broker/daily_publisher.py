@@ -33,8 +33,9 @@ from aiogram.types import BufferedInputFile
 
 from core.formatters import TextGenerator
 from core.models import ProductData
-from db import get_published_ids, mark_published
+from db import get_published_ids, mark_published, save_media
 from services.takprodam import TakProDamClient
+from services.media_storage import save_photo
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +286,21 @@ async def _send_to_telegram(item: dict) -> None:
         if image_url:
             img_bytes = await _download_image(image_url)
             if img_bytes:
+                # Сохраняем для VK-клипа
+                try:
+                    local_path = save_photo(img_bytes, image_url, source="daily_publisher")
+                    if local_path:
+                        await save_media(
+                            source="daily_publisher",
+                            image_path=local_path,
+                            title=item.get("title"),
+                            price_rub=item.get("price"),
+                            post_text=post_text,
+                            image_url=image_url,
+                        )
+                except Exception as e:
+                    logger.warning("Daily publisher: не удалось сохранить фото: %s", e)
+                
                 try:
                     await bot.send_photo(
                         chat_id=TELEGRAM_GROUP_ID,

@@ -22,13 +22,14 @@ from aiogram.types import BufferedInputFile
 
 from core.formatters import TextGenerator
 from core.models import ProductData
-from db import get_published_referral_ids, mark_referral_published, save_product
+from db import get_published_referral_ids, mark_referral_published, save_product, save_media
 from parsers.yandex import (
     YandexParser,
     parse_search,
     parse_card,
     ParseStatus,
 )
+from services.media_storage import save_photo
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +349,21 @@ async def _send_to_telegram(item: dict, referral_link: str) -> None:
         if image_url:
             img = await _download_image(image_url)
             if img:
+                # Сохраняем для VK-клипа
+                try:
+                    local_path = save_photo(img, image_url, source="yandex_referral")
+                    if local_path:
+                        await save_media(
+                            source="yandex_referral",
+                            image_path=local_path,
+                            title=item.get("title"),
+                            price_rub=item.get("price_rub"),
+                            post_text=text,
+                            image_url=image_url,
+                        )
+                except Exception as e:
+                    logger.warning("Yandex referral: не удалось сохранить фото: %s", e)
+                
                 try:
                     await bot.send_photo(
                         chat_id=TELEGRAM_GROUP_ID,
