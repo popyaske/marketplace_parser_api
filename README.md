@@ -1,6 +1,6 @@
 # Marketplace Parser API
 
-Система для парсинга товаров с российских маркетплейсов (**Ozon**, **Wildberries**, **AliExpress**, **Яндекс.Маркет**) с сохранением результатов в PostgreSQL, постингом в Telegram и веб-дашбордом.
+Система для парсинга товаров с российских маркетплейсов (**Ozon**, **Wildberries**, **AliExpress**, **Яндекс.Маркет**) с сохранением результатов в PostgreSQL, автоматической публикацией в Telegram и веб-дашбордом.
 
 ---
 
@@ -13,6 +13,7 @@
 - [Быстрый старт](#быстрый-старт)
 - [Переменные окружения](#переменные-окружения)
 - [Chrome CDP](#chrome-cdp)
+- [Источники публикаций](#источники-публикаций)
 - [API](#api)
 - [Парсеры](#парсеры)
 - [Очереди RabbitMQ](#очереди-rabbitmq)
@@ -23,13 +24,17 @@
 ## Возможности
 
 - 🔍 **Парсинг 4 маркетплейсов**: Ozon, Wildberries, AliExpress, Яндекс.Маркет
-- 🐇 **Асинхронная обработка** через RabbitMQ (очереди incoming / results / errors)
-- 🗄 **Хранение в PostgreSQL** с историей цен (`PriceHistory`)
-- 📢 **Автопостинг в Telegram-канал** с картинкой и текстом (aiogram + прокси)
-- 📊 **Веб-дашборд** (React + Vite): фильтры, поиск, статистика, SSE-обновления
-- 🌐 **REST API** на FastAPI: парсинг, очередь, результаты, сравнение цен, экспорт CSV
-- 🧩 **Chrome CDP-фолбэк** для обхода антибот-защиты (x5sec, SmartCaptcha)
-- 🐳 **Docker Compose**: postgres, rabbitmq, parser, worker, frontend
+- 🐇 **Асинхронная обработка** через RabbitMQ (incoming / results / errors)
+- 🗄 **PostgreSQL** + история цен (`PriceHistory`)
+- 📢 **Telegram-публикация** — три независимых канала:
+  - результаты парсинга URL из очереди (`parser.results.telegram`);
+  - **ежедневная публикация 1 товара из каталога Такпродам** (`daily_publisher`);
+  - **публикация каждые 10 минут из реферальной программы Яндекс.Маркета** (`yandex_referral_publisher`).
+- 🔗 **Автополучение реферальной ссылки** Яндекс.Маркета через CDP — клик «Поделиться» → перехват `clipboard.writeText` → ссылка `/cc/xxxxx`.
+- 🚫 **Защита от дублей**: `published_products` (Такпродам) и `published_referral_products` (Яндекс).
+- 📊 **React-дашборд**: фильтры, поиск, статистика, SSE-обновления, превью постов.
+- 🌐 **REST API** на FastAPI: парсинг, очередь, результаты, сравнение цен, экспорт CSV.
+- 🧩 **Chrome CDP** для обхода антибот-защиты (x5sec, SmartCaptcha, реферальные попапы).
 
 ---
 
@@ -44,31 +49,35 @@
                                                  ▼
                                         ┌──────────────────┐
                                         │  worker.py       │
-                                        │  (consumers)     │
                                         └────────┬─────────┘
                                                  │
-                       parser.results.fanout     │
-                    ┌────────────────────────────┼───────────────────┐
-                    ▼                            ▼                   ▼
-            parser.results.storage       parser.results.telegram   parser.errors
+                    ┌────────────────────────────┼──────────────────────────┐
+                    │                            │                          │
+                    ▼                            ▼                          ▼
+             parser.results.storage      parser.results.telegram     parser.errors
                     │                            │
                     ▼                            ▼
              ┌─────────────┐              ┌──────────────┐
              │ PostgreSQL  │              │  Telegram    │
              └─────────────┘              └──────────────┘
-                    ▲
-                    │  SSE / REST
-             ┌──────┴───────┐
-             │  frontend    │
-             │  (React)     │
-             └──────────────┘
+                    ▲                            ▲
+                    │                            │
+                    │                       daily_publisher
+                    │                       yandex_referral_publisher
+                    │                            │
+             ┌──────┴───────┐         ┌──────────┴──────────┐
+             │  frontend    │         │  Такпродам API      │
+             │  (React)     │         │  Яндекс.Маркет CDP  │
+             └──────────────┘         └─────────────────────┘
 ```
 
-- **parser** — FastAPI-сервис, принимает URL, публикует в очередь `parser.incoming`.
-- **worker** — консьюмеры: парсит URL, публикует результат в **fanout** exchange `parser.results.fanout`.
-- **storage_consumer** — сохраняет результат в PostgreSQL + пишет историю цен.
-- **telegram_consumer** — постит товар в канал (фото + текст).
-- **frontend** — React-дашборд, проксирует `/api/*` на `parser:8000`.
+- **parser** — FastAPI, принимает URL, публикует в `parser.incoming`.
+- **worker** — 4 консьюмера + 2 планировщика публикаций.
+- **storage_consumer** — сохраняет в PostgreSQL.
+- **telegram_consumer** — публикует результаты обычного парсинга.
+- **daily_publisher** — раз в сутки 1 товар из каталога Такпродам.
+- **yandex_referral_publisher** — каждые 10 минут 1 товар из рефералки Яндекс.Маркета.
+- **frontend** — React-дашборд, проксирует `/api/*` → `parser:8000`.
 
 ---
 
@@ -80,7 +89,8 @@
 | Брокер | RabbitMQ 3.13, `aio-pika` |
 | БД | PostgreSQL 16, SQLAlchemy 2 (async), asyncpg |
 | Парсинг | httpx, Playwright, `websocket-client` (Chrome CDP) |
-| Telegram | aiogram 3, aiohttp (socks proxy) |
+| Telegram | aiogram 3, aiohttp (SOCKS5-прокси) |
+| Внешние API | Такпродам (`api.takprodam.ru`), Яндекс.Маркет (SSR + CDP) |
 | Frontend | React 18, TypeScript, Vite 5, nginx |
 | Инфра | Docker, Docker Compose |
 
@@ -90,50 +100,49 @@
 
 ```
 .
-├── main.py                       # FastAPI приложение (parser)
-├── worker.py                     # Воркер: консьюмеры RabbitMQ
-├── worker_health.py              # /health на :8080 для воркера
-├── db.py                         # SQLAlchemy модели + репозиторий
-├── Dockerfile                    # Универсальный образ (parser + worker)
+├── main.py                        # FastAPI приложение (parser)
+├── worker.py                      # Воркер: консьюмеры + 2 планировщика
+├── worker_health.py               # /health на :8080 для воркера
+├── db.py                          # SQLAlchemy модели + репозиторий
+├── Dockerfile                     # Универсальный образ (parser + worker)
 ├── docker-compose.yml
 ├── requirements.txt
 ├── requirements-test.txt
-├── start-chrome-cdp.bat          # Запуск Chrome с CDP на Windows
+├── start-chrome-cdp.bat           # Запуск Chrome с CDP на Windows
 │
 ├── broker/
-│   ├── connection.py             # Broker (aio-pika) + объявление очередей
-│   ├── producer.py               # send_url / send_urls
-│   ├── consumer.py               # читает incoming, парсит, публикует results
-│   ├── storage_consumer.py       # сохраняет results в PostgreSQL
-│   └── telegram_consumer.py      # постит results в Telegram
+│   ├── connection.py              # Broker (aio-pika) + очереди
+│   ├── producer.py                # send_url / send_urls
+│   ├── consumer.py                # incoming → parse → results
+│   ├── storage_consumer.py        # results → PostgreSQL
+│   ├── telegram_consumer.py       # results → Telegram
+│   ├── daily_publisher.py         # Такпродам → Telegram (раз в сутки)
+│   └── yandex_referral_publisher.py  # Яндекс.Маркет → Telegram (каждые 10 мин)
 │
 ├── parsers/
-│   ├── base.py                   # BaseParser (fetch_cached, TTLCache)
-│   ├── ozon.py                   # Ozon (composer-api + CDP)
-│   ├── wildberries.py            # WB (internal API v4 + CDP/Playwright)
-│   ├── aliexpress.py             # AliExpress (CDP + DOM)
-│   └── yandex.py                 # Яндекс.Маркет (SSR state + CDP)
-│
-├── routers/
-│   ├── parse.py                  # POST /parse, GET /health, /cdp-check
-│   ├── queue.py                  # POST /queue/enqueue(-batch), /queue/status
-│   ├── results.py                # GET /results, /stats, /stream, /export/csv
-│   └── compare.py                # POST /compare
+│   ├── base.py                    # BaseParser + TTLCache
+│   ├── ozon.py                    # Ozon (composer-api + CDP)
+│   ├── wildberries.py             # WB (internal v4 + CDP/Playwright)
+│   ├── aliexpress.py              # AliExpress (CDP + DOM)
+│   └── yandex.py                  # Яндекс.Маркет (SSR + CDP + реф. ссылки)
 │
 ├── services/
-│   └── marketplace.py            # MarketplaceFactory (URL → парсер)
+│   ├── marketplace.py             # MarketplaceFactory (URL → парсер)
+│   └── takprodam.py               # Клиент API Такпродам
+│
+├── routers/
+│   ├── parse.py                   # POST /parse, /health, /cdp-check
+│   ├── queue.py                   # POST /queue/enqueue(-batch), /queue/status
+│   ├── results.py                 # GET /results, /stats, /stream, /export/csv
+│   └── compare.py                 # POST /compare
 │
 ├── core/
-│   ├── models.py                 # ProductData, MarketplaceType
-│   └── formatters.py             # PriceFormatter, TextGenerator
+│   ├── models.py                  # ProductData, MarketplaceType
+│   └── formatters.py              # PriceFormatter, TextGenerator
 │
-├── config/
-│   └── settings.py               # CDP_HOST, CDP_PORT, LOG_LEVEL, ...
+├── config/settings.py             # CDP_HOST, CDP_PORT, LOG_LEVEL
 │
-├── scripts/
-│   └── read_result.py            # Утилита для чтения из results.storage
-│
-└── frontend/                     # React + Vite + nginx
+└── frontend/                      # React + Vite + nginx
     ├── Dockerfile
     ├── nginx.conf
     └── src/
@@ -146,10 +155,9 @@
 
 ## Быстрый старт
 
-### 1. Запуск Chrome с CDP (для обхода антибота)
+### 1. Chrome с CDP (обязательно для 4 парсеров)
 
-**Windows** — запустить `start-chrome-cdp.bat`.
-
+**Windows** — `start-chrome-cdp.bat`.
 **Вручную:**
 ```bash
 chrome --remote-debugging-port=9222 \
@@ -159,17 +167,15 @@ chrome --remote-debugging-port=9222 \
 ```
 
 В этом Chrome:
-1. Открыть и залогиниться на `ozon.ru`, `wildberries.ru`, `market.yandex.ru`, `aliexpress.ru`.
+1. Войти в `ozon.ru`, `wildberries.ru`, `market.yandex.ru`, `aliexpress.ru`.
 2. Пройти капчу/x5sec вручную, если появится.
-3. Оставить вкладки открытыми — парсеры будут их переиспользовать.
+3. Оставить вкладку `market.yandex.ru` открытой — нужна для получения реферальных ссылок.
 
 ### 2. Запуск стека
 
 ```bash
 docker compose up -d --build
 ```
-
-Сервисы:
 
 | Сервис | URL |
 |--------|-----|
@@ -193,7 +199,7 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
   -d '{"url":"https://www.ozon.ru/product/1234567890/"}'
 ```
 
-Через ~10 секунд результат появится в дашборде или в БД.
+Результат появится в дашборде через ~10 сек.
 
 ---
 
@@ -203,7 +209,7 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
 
 | Переменная | По умолчанию | Описание |
 |------------|--------------|----------|
-| `CDP_HOST` | `127.0.0.1` | Хост Chrome CDP. В Docker — `host.docker.internal` или IP хоста |
+| `CDP_HOST` | `127.0.0.1` | Хост Chrome CDP (в Docker — IP хоста) |
 | `CDP_PORT` | `9222` | Порт Chrome CDP |
 | `RABBITMQ_URL` | `amqp://guest:guest@rabbitmq:5672/` | Адрес RabbitMQ |
 | `DATABASE_URL` | `postgresql+asyncpg://parser:parser@postgres:5432/parser` | DSN PostgreSQL |
@@ -213,31 +219,99 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
 
 | Переменная | Описание |
 |------------|----------|
-| `TELEGRAM_BOT_TOKEN` | Токен бота для постинга |
-| `TELEGRAM_CHANNEL_ID` | ID канала (например `@my_channel` или `-1001234567890`) |
-| `TELEGRAM_PROXY_URL` | Прокси (например `socks5://user:pass@host:1080`) |
+| `TELEGRAM_BOT_TOKEN` | Токен бота |
+| `TELEGRAM_CHANNEL_ID` | ID канала для обычных результатов |
+| `TELEGRAM_GROUP_ID` | ID группы для daily_publisher и yandex_referral (fallback = CHANNEL_ID) |
+| `TELEGRAM_PROXY_URL` | SOCKS5/HTTP-прокси (`socks5://user:pass@host:1080`) |
+| `TAKPRODAM_API_TOKEN` | Токен из ЛК Такпродам |
+| `TAKPRODAM_SOURCE_ID` | id подтверждённой площадки (`status=approved`) |
+| `TAKPRODAM_MARKETPLACE` | Опциональный фильтр: `Ozon`/`Wildberries`/`Avito`/`Aliexpress` |
+| `TAKPRODAM_SUBID` | Метка трафика (по умолчанию `tg_daily`) |
+| `PUBLISH_HOUR` | Час публикации Такпродам по локали (по умолчанию `20`) |
+| `PUBLISH_TZ_OFFSET` | Смещение таймзоны, МСК = `3` |
+| `YANDEX_REFERRAL_INTERVAL` | Интервал публикации рефералки Яндекса в секундах (по умолчанию `600`) |
+
+Пример `.env`:
+```env
+TELEGRAM_BOT_TOKEN=123456:AAA...
+TELEGRAM_CHANNEL_ID=@my_channel
+TELEGRAM_GROUP_ID=-1001234567890
+TELEGRAM_PROXY_URL=socks5://user:pass@host:1080
+
+TAKPRODAM_API_TOKEN=xxxx-xxxx-xxxx
+TAKPRODAM_SOURCE_ID=12345
+TAKPRODAM_MARKETPLACE=Ozon
+TAKPRODAM_SUBID=tg_daily
+PUBLISH_HOUR=20
+PUBLISH_TZ_OFFSET=3
+
+YANDEX_REFERRAL_INTERVAL=600
+```
 
 ---
 
 ## Chrome CDP
 
-Три из четырёх маркетплейсов используют Chrome DevTools Protocol как фолбэк или как основной источник:
+Три из четырёх парсеров используют Chrome DevTools Protocol:
 
-| Парсер | Основной источник | CDP-роль |
+| Парсер | Основной источник | Роль CDP |
 |--------|-------------------|----------|
-| **Ozon** | composer-api.bx (httpx) | Tier 2: fetch из залогиненной вкладки + чтение DOM цен |
-| **Wildberries** | `__internal/card/cards/v4/detail` | Tier 1: чтение токена/deviceid/xinfo из localStorage + fetch. Tier 2: Playwright |
-| **AliExpress** | — | Основной: чтение DOM открытой вкладки `/item/<id>.html` |
-| **Яндекс.Маркет** | SSR `data-apiary="patch"` | Фолбэк: если SSR пустой — hard reload + чтение outerHTML/цен из DOM |
+| **Ozon** | composer-api.bx (httpx) | Tier 2: fetch из залогиненной вкладки + чтение DOM |
+| **Wildberries** | `__internal/card/cards/v4/detail` | Tier 1: токен/deviceid/xinfo из localStorage + fetch |
+| **AliExpress** | DOM открытой вкладки | Единственный источник данных |
+| **Яндекс.Маркет** | SSR `data-apiary="patch"` | Фолбэк + получение реферальной ссылки |
 
-**Ключевое условие:** во вкладке Chrome должен быть **залогиненный пользователь** с открытой страницей маркетплейса. Парсеры переиспользуют cookies, localStorage и fingerprint.
+### Получение реферальной ссылки Яндекса
 
-В `docker-compose.yml` для контейнеров задано:
-```yaml
-extra_hosts:
-  - "host.docker.internal:host-gateway"
-```
-Это позволяет обращаться к Chrome на хосте. **На Linux** замените `CDP_HOST: 192.168.65.254` на IP хоста в локальной сети (например `172.17.0.1`).
+Ключевая логика (`YandexParser._cdp_get_referral_link`):
+
+1. Навигация на карточку товара.
+2. Установка перехватчиков `navigator.clipboard.writeText`, `fetch`, `XMLHttpRequest`.
+3. Поиск и клик по кнопке «Поделиться» (`data-zone-name="customSharingPopup"`, `aria-label`, текст).
+4. Клик по «Копировать ссылку» (`data-zone-name="copyLinkButton"`).
+5. Возврат ссылки `/cc/xxxxx` из перехваченного буфера + HTML карточки за тот же рейс.
+
+**Требования:** залогиненный Яндекс ID в Chrome + открытая вкладка `market.yandex.ru`.
+
+**В Docker** для доступа к Chrome на хосте задано `extra_hosts: host.docker.internal:host-gateway`. На Linux замените `CDP_HOST` на IP хоста в вашей сети.
+
+---
+
+## Источники публикаций
+
+В проекте работают три независимых канала публикации в Telegram:
+
+### 1. Обычный парсинг (`telegram_consumer.py`)
+
+- **Триггер:** URL в очереди `parser.incoming`.
+- **Логика:** парсинг → результат в fanout → storage + telegram.
+- **Фильтры:** `success`, `price_rub`/`price_with_plus`, `in_stock`.
+- **Целевой чат:** `TELEGRAM_CHANNEL_ID`.
+
+### 2. Такпродам (`daily_publisher.py`)
+
+- **Триггер:** раз в сутки в `PUBLISH_HOUR:00` (МСК).
+- **Источник:** `GET /v2/publisher/product/?source_id=...` из API Такпродам.
+- **Логика:** фильтр по `published_products` → случайный товар → публикация → отметка в БД.
+- **Текст:** `TextGenerator.generate()` + `legal_text` из ответа.
+- **Целевой чат:** `TELEGRAM_GROUP_ID`.
+
+### 3. Рефералка Яндекс.Маркета (`yandex_referral_publisher.py`)
+
+- **Триггер:** раз в `YANDEX_REFERRAL_INTERVAL` секунд (по умолчанию 600 = 10 минут).
+- **Источник:** `https://market.yandex.ru/page/referral_products?tabId=TOP_REWARD`.
+- **Логика:**
+  1. CDP → загрузка страницы → `parse_search()` (SSR-состояние).
+  2. Фильтр по `published_referral_products` + наличию картинки.
+  3. До 5 попыток на товар — берётся тот, у которого получилось достать реферальную ссылку.
+  4. Для найденного товара — `_cdp_get_referral_link()` → клик → ссылка `/cc/xxx` + HTML карточки.
+  5. `_card_from_html()` парсит HTML → цены (Pay / обычная / зачёркнутая).
+  6. `save_product()` → товар появляется в дашборде.
+  7. `_send_to_telegram()` → пост с реферальной ссылкой.
+  8. `mark_referral_published()` → защита от повторной публикации.
+- **Целевой чат:** `TELEGRAM_GROUP_ID`.
+
+**Особенности текста поста:** цена Яндекс Пэй показывается как основная, обычная (или зачёркнутая) — как «Было».
 
 ---
 
@@ -251,7 +325,6 @@ extra_hosts:
 ```json
 {"url": "https://www.ozon.ru/product/1234567890/"}
 ```
-Возвращает `ProductResponse` с полями товара и сгенерированным `post_text`.
 
 ### Очередь (асинхронный)
 
@@ -277,8 +350,8 @@ extra_hosts:
 
 | Метод | Эндпоинт | Описание |
 |-------|----------|----------|
-| GET | `/health` | Healthcheck парсера |
-| GET | `/cdp-check` | Диагностика доступности Chrome CDP |
+| GET | `/health` | Healthcheck |
+| GET | `/cdp-check` | Диагностика Chrome CDP |
 | POST | `/compare` | Сравнение цен по 4 маркетплейсам |
 
 ---
@@ -287,33 +360,25 @@ extra_hosts:
 
 ### Ozon (`parsers/ozon.py`)
 
-1. **Tier 1:** `https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=/product/<sku>/` через httpx с реалистичными заголовками.
-2. **Tier 2:** если HTTP 403 — fetch изнутри залогиненной вкладки `ozon.ru` через CDP.
-3. **Fallback:** цены читаются прямо из DOM (`.pdp_b2h`, `.pdp_b2i`).
+- **Tier 1:** `composer-api.bx` через httpx.
+- **Tier 2:** CDP fetch из залогиненной вкладки.
+- **Fallback:** чтение цен из DOM (`.pdp_b2h`, `.pdp_b2i`).
 
 ### Wildberries (`parsers/wildberries.py`)
 
-С ноября 2026 WB закрыл анонимный доступ к `card.wb.ru`. Работает только авторизованный `__internal/card/cards/v4/detail`.
-
-1. **Tier 1 (CDP):** из localStorage вкладки берутся `wbid-oauth-sdk-access-token`, `wbx__sessionID`, `xinfo`; выполняется `fetch` с `Bearer`-токеном.
-2. **Tier 2 (Playwright):** тот же запрос через `page.request.get` в свежем Chromium.
-
-Картинка товара ищется двумя способами: regex по HTML карточки → навигация на карточку + DOM-селектор.
+- **Tier 1 (CDP):** `Bearer`-токен + `deviceid` + `xinfo` из localStorage → `fetch` на `__internal/card/cards/v4/detail`.
+- **Tier 2 (Playwright):** `page.request.get` со теми же заголовками.
 
 ### AliExpress (`parsers/aliexpress.py`)
 
-Читает DOM **уже открытой** вкладки `/item/<id>.html`. Селекторы классов:
-- Цена: `HazeProductPrice_SnowPrice__mainM/S`
-- Старая цена: `HazeProductPrice_SnowPrice__secondPrice`
-- Картинка: `img[src*="aliexpress-media"]` (апгрейд до 960x960)
+- Чтение DOM уже открытой вкладки `/item/<id>.html`.
+- Селекторы `HazeProductPrice_SnowPrice__mainM/S`, апгрейд картинок до 960x960.
 
 ### Яндекс.Маркет (`parsers/yandex.py`)
 
-1. **SSR:** httpx получает HTML, ищет `<noframes data-apiary="patch">` (JSON-стейт).
-2. **CDP-фолбэк:** при `empty_product_shell` / `ok_ldjson_only` — жёсткий reload через CDP, ожидание появления `allPrices`/`baobab`, чтение `outerHTML`.
-3. **DOM-цены:** если SSR-стейта нет, JS извлекает все `₽`-цены из DOM и встраивает в `<script id="__cdp_prices__">`.
-
-`share_url` берётся из коллекции `share` и подставляется в пост для Яндекса.
+- **SSR:** `<noframes data-apiary="patch">` → `parse_search()` / `parse_card()`.
+- **CDP-фолбэк:** hard reload → ожидание `allPrices` → `outerHTML` → `parse_card()`.
+- **Реферальные ссылки:** `_cdp_get_referral_link()` — клик + перехват `clipboard`.
 
 ---
 
@@ -326,27 +391,23 @@ extra_hosts:
 | `parser.results.storage` | fanout | Результаты → PostgreSQL |
 | `parser.results.telegram` | fanout | Результаты → Telegram |
 
-Exchange `parser.results.fanout` (тип `fanout`) — публикует результат в обе очереди одновременно.
+Exchange `parser.results.fanout` — публикует в обе очереди одновременно.
 
 ---
 
 ## Разработка и тесты
 
-### Локальный запуск (без Docker)
+### Локальный запуск
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 
-# поднять postgres и rabbitmq (например, в докере)
 docker compose up -d postgres rabbitmq
 
-# запустить API
 uvicorn main:app --reload
-
-# в отдельном окне — воркер
-python worker.py
+python worker.py   # в отдельном окне
 ```
 
 ### Тесты
@@ -361,20 +422,49 @@ pytest
 ```bash
 cd frontend
 npm install
-npm run dev      # dev на :5173
-npm run build    # production сборка
+npm run dev      # :5173
+npm run build
+```
+
+### Разовые тесты публикаторов
+
+```bash
+# Такпродам — опубликовать 1 товар сейчас
+docker compose exec worker python -c "
+import asyncio
+from broker.daily_publisher import _publish_one
+asyncio.run(_publish_one())
+"
+
+# Яндекс.рефералка — опубликовать 1 товар сейчас
+docker compose exec worker python -c "
+import asyncio
+from broker.yandex_referral_publisher import _publish_one
+asyncio.run(_publish_one())
+"
+
+# Получить реферальную ссылку без публикации
+docker compose exec worker python -c "
+from parsers.yandex import YandexParser
+p = YandexParser()
+print(p._cdp_get_referral_link('https://market.yandex.ru/card/.../1234567890'))
+"
 ```
 
 ---
 
 ## Особенности эксплуатации
 
-- **CDP-вкладки должны быть залогинены.** Если WB/AliExpress/Ozon показывают капчу — откройте вкладку вручную и пройдите проверку.
-- **Сессии живут ограниченно.** Токены WB хранятся в кэше парсера 5 минут (`_creds_ttl`).
-- **TTL-кэш результатов:** `fetch_cached` кэширует успешные результаты на 5 минут (`TTLCache(maxsize=500, ttl=300)`).
-- **Rate-limit** на `/queue/enqueue` — 30 запросов/минуту с IP (slowapi).
-- **Auto-reconnect:** воркер при падении перезапускается через 5 секунд (см. `worker.py`).
-- **История цен:** каждое сохранение товара добавляет запись в `price_history`, даже если товар уже есть (upsert по `url + marketplace`).
+- **CDP-вкладки должны быть залогинены.** Без этого Яндекс не покажет `copyLinkButton`, WB не отдаст данные, AliExpress покажет x5sec.
+- **Реферальная ссылка не у всех товаров.** Некоторые товары на `referral_products` не участвуют в программе — `_publish_one` пробует до 5 штук и пропускает «пустые».
+- **Сессии живут ограниченно.** Токены WB кэшируются 5 минут (`_creds_ttl`).
+- **TTL-кэш результатов:** `fetch_cached` кэширует успешный парсинг на 5 минут.
+- **Rate-limit** на `/queue/enqueue` — 30/мин с IP (slowapi).
+- **Auto-reconnect:** воркер перезапускается через 5 секунд при падении.
+- **История цен:** каждое сохранение пишет в `price_history`, даже для существующих товаров (upsert по `url + marketplace`).
+- **Дедупликация публикаций:**
+  - Такпродам: `UNIQUE(published_products.takprodam_id)`.
+  - Яндекс: `UNIQUE(published_referral_products.product_id)`.
 
 ---
 
