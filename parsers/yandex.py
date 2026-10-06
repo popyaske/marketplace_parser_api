@@ -533,6 +533,10 @@ def parse_card(html: str) -> dict:
     return result
 
 
+def extract_promo_from_card(html: str) -> dict:
+    """Отключено — промокод не используется."""
+    return {}
+
 # === Основной класс ===
 
 class YandexParser(BaseParser):
@@ -1258,6 +1262,13 @@ class YandexParser(BaseParser):
             return ProductData(url=url, marketplace=self.marketplace,
                                success=False, error="parser_drift — нет title на карточке")
 
+        promo = extract_promo_from_card(html)
+        if promo:
+            log.info(
+                "yandex: промокод найден — %s (%s%%)",
+                promo.get("promo_code"), promo.get("promo_percent"),
+            )
+
         return ProductData(
             title=parsed.get("title") or "Не найдено",
             price_rub=parsed.get("price_rub"),
@@ -1272,6 +1283,8 @@ class YandexParser(BaseParser):
             rating=parsed.get("rating"),
             rating_count=parsed.get("rating_count"),
             image_url=parsed.get("image"),
+            promo_code=promo.get("promo_code"),
+            promo_percent=promo.get("promo_percent"),
             success=True,
             tier_used=tier,
         )

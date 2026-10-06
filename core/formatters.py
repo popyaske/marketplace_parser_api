@@ -2,7 +2,6 @@
 import re
 from .models import ProductData
 
-
 class PriceFormatter:
     """Утилиты для форматирования цен"""
 
@@ -32,6 +31,7 @@ class PriceFormatter:
             formatted = str(int(number))
 
         return f"{formatted}₽"
+
 
 
 class TextGenerator:

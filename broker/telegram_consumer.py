@@ -124,7 +124,12 @@ async def run_telegram_consumer():
                                         source="telegram_consumer",
                                         image_path=local_path,
                                         title=data.get("title"),
+                                        brand=data.get("brand") or data.get("seller") or "",
                                         price_rub=data.get("price_rub"),
+                                        price_with_plus=data.get("price_with_plus"),
+                                        price_original_rub=data.get("price_original_rub"),
+                                        rating=data.get("rating"),
+                                        rating_count=data.get("rating_count"),
                                         post_text=post_text,
                                         image_url=image_url,
                                     )

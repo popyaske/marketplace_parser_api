@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -22,7 +23,7 @@ from aiogram.types import BufferedInputFile
 
 from core.formatters import TextGenerator
 from core.models import ProductData
-from db import get_published_referral_ids, mark_referral_published, save_product, save_media
+from db import get_published_referral_ids, mark_referral_published, save_product, save_media, cleanup_old_referral_publications
 from parsers.yandex import (
     YandexParser,
     parse_search,
@@ -30,15 +31,17 @@ from parsers.yandex import (
     ParseStatus,
 )
 from services.media_storage import save_photo
+from services.overlay_maker import render_product_card
 
 logger = logging.getLogger(__name__)
 
-REFERRAL_URL = (
+REFERRAL_BASE = (
     "https://market.yandex.ru/page/referral_products"
     "?tabId=TOP_REWARD"
     "&generalContext=t%3DcprPage%3Bcpk%3Dreferral_products%3B"
     "&how=explicit_order"
 )
+REFERRAL_PAGES = int(os.getenv("YANDEX_REFERRAL_PAGES", "3"))
 
 PUBLISH_INTERVAL = int(os.getenv("YANDEX_REFERRAL_INTERVAL", "600"))  # сек
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -46,12 +49,16 @@ TELEGRAM_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID") or os.getenv("TELEGRAM_CHANNE
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
 
+def _build_referral_url(page: int) -> str:
+    if page <= 1:
+        return REFERRAL_BASE
+    return f"{REFERRAL_BASE}&page={page}"
+
 # ============================================================
 # Планировщик
 # ============================================================
 
 async def run_yandex_referral_publisher():
-    """Раз в PUBLISH_INTERVAL секунд публикует 1 новый товар."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID:
         logger.warning("Yandex referral: нет TELEGRAM_BOT_TOKEN/TELEGRAM_GROUP_ID, выключаюсь")
         return
@@ -61,9 +68,22 @@ async def run_yandex_referral_publisher():
         PUBLISH_INTERVAL, PUBLISH_INTERVAL / 60.0,
     )
 
-    # Первый запуск — сразу, чтобы не ждать 10 минут
+    last_cleanup = 0.0
+
     while True:
         try:
+            # Раз в сутки — чистим старые публикации (TTL 7 дней)
+            now = time.monotonic()
+            if now - last_cleanup > 86400:
+                deleted = await cleanup_old_referral_publications(days=7)
+                if deleted:
+                    logger.info(
+                        "Yandex referral: TTL-очистка — удалено %d старых записей "
+                        "(товары снова доступны для публикации)",
+                        deleted,
+                    )
+                last_cleanup = now
+
             await _publish_one()
         except asyncio.CancelledError:
             logger.info("Yandex referral publisher остановлен")
@@ -81,21 +101,44 @@ async def run_yandex_referral_publisher():
 async def _publish_one() -> None:
     parser = YandexParser()
     try:
-        html = await asyncio.to_thread(parser._cdp_fetch_html, REFERRAL_URL)
-        if not html:
-            logger.warning("Yandex referral: CDP не вернул HTML")
+        all_items: list[dict] = []
+        seen_ids: set[str] = set()
+
+        for page in range(1, REFERRAL_PAGES + 1):
+            url = _build_referral_url(page)
+            html = await asyncio.to_thread(parser._cdp_fetch_html, url)
+            if not html:
+                logger.warning("Yandex referral: стр.%d не дала HTML", page)
+                break
+
+            items = _parse_referral_page(html)
+            logger.info("Yandex referral: стр.%d → %d товаров", page, len(items))
+
+            if not items:
+                break
+
+            added = 0
+            for it in items:
+                pid = str(it.get("product_id") or "")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    all_items.append(it)
+                    added += 1
+
+            # Если на странице не появилось ничего нового — дальше нет смысла
+            if added == 0 and page > 1:
+                logger.info("Yandex referral: стр.%d не дала новых товаров, стоп", page)
+                break
+
+        if not all_items:
+            logger.warning("Yandex referral: нет товаров ни на одной странице")
             return
 
-        items = _parse_referral_page(html)
-        if not items:
-            logger.warning("Yandex referral: на странице нет товаров")
-            return
-
-        logger.info("Yandex referral: на странице %d товаров", len(items))
+        logger.info("Yandex referral: всего уникальных товаров — %d", len(all_items))
 
         published = await get_published_referral_ids()
         fresh = [
-            it for it in items
+            it for it in all_items
             if it.get("product_id")
                and str(it["product_id"]) not in published
                and it.get("image")
@@ -104,9 +147,9 @@ async def _publish_one() -> None:
             logger.info("Yandex referral: новых товаров нет")
             return
 
-        random.shuffle(fresh)              # перемешиваем — пробуем в разном порядке
-        max_attempts = min(len(fresh), 5)  # не больше 5 попыток за один цикл
-
+        random.shuffle(fresh)
+        max_attempts = min(len(fresh), 5)
+        # дальше — цикл по attempts, как было
         for attempt, candidate in enumerate(fresh[:max_attempts], 1):
             product_id = str(candidate["product_id"])
             product_url = (
@@ -237,9 +280,6 @@ def _card_from_html(html: str, fallback_item: dict) -> dict:
     """
     Парсит HTML карточки через parse_card() и возвращает dict полей,
     совместимый с candidate из _parse_referral_page().
-
-    Пустые поля из карточки не затирают данные referral-страницы —
-    используется fallback_item.
     """
     try:
         card = parse_card(html)
@@ -272,7 +312,6 @@ def _card_from_html(html: str, fallback_item: dict) -> dict:
         "sku_id": card.get("sku_id") or fallback_item.get("product_id"),
     }
 
-
 # ============================================================
 # Telegram (в стиле telegram_consumer.py)
 # ============================================================
@@ -301,7 +340,6 @@ async def _download_image(url: str) -> Optional[bytes]:
         logger.warning("Yandex referral: не удалось скачать фото %s: %s", url, e)
         return None
 
-
 def _build_post_text(item: dict, referral_link: str) -> str:
     """
     Пост для реферального товара через общий TextGenerator.
@@ -311,6 +349,11 @@ def _build_post_text(item: dict, referral_link: str) -> str:
       price_original_rub ← зачёркнутая (или обычная, если она больше главной)
       price_with_plus    ← None (чтобы TG не подставил «Стало: плюс»)
       url                ← реферальная ссылка
+      promo_code         ← item["promo_code"]      (например, "HOME15C")
+      promo_percent      ← item["promo_percent"]   (например, 15)
+
+    TextGenerator сам вставит строку «🎟 Промокод: `HOME15C` (–15%)»
+    сразу после «✅ Стало: …».
     """
     pay = item.get("price_with_plus")      # цена с Яндекс Пэй
     regular = item.get("price_rub")        # обычная цена
@@ -336,7 +379,11 @@ def _build_post_text(item: dict, referral_link: str) -> str:
         image_url=item.get("image"),
         success=True,
         tier_used="yandex_referral",
+        # === Промокод — передаём, чтобы TextGenerator вставил строку ===
+        promo_code=item.get("promo_code"),
+        promo_percent=item.get("promo_percent"),
     )
+
     return TextGenerator.generate(product)
 
 
@@ -349,7 +396,7 @@ async def _send_to_telegram(item: dict, referral_link: str) -> None:
         if image_url:
             img = await _download_image(image_url)
             if img:
-                # Сохраняем для VK-клипа
+                # === 1. Сохраняем ОРИГИНАЛ для VK-клипа ===
                 try:
                     local_path = save_photo(img, image_url, source="yandex_referral")
                     if local_path:
@@ -357,13 +404,46 @@ async def _send_to_telegram(item: dict, referral_link: str) -> None:
                             source="yandex_referral",
                             image_path=local_path,
                             title=item.get("title"),
+                            brand=item.get("brand") or "",
                             price_rub=item.get("price_rub"),
+                            price_with_plus=item.get("price_with_plus"),
+                            price_original_rub=item.get("price_old_rub"),
+                            rating=item.get("rating"),
+                            rating_count=item.get("rating_count"),
+                            legal_text="Реклама. ООО «ЯНДЕКС МАРКЕТ», ИНН: 9704254424",
+                            promo_code=item.get("promo_code"),
+                            promo_percent=item.get("promo_percent"),
                             post_text=text,
                             image_url=image_url,
                         )
                 except Exception as e:
                     logger.warning("Yandex referral: не удалось сохранить фото: %s", e)
-                
+
+                # === 2. Рендерим стилизованную карточку для Telegram ===
+                try:
+                    styled = render_product_card(
+                        img,
+                        title=item.get("title") or "",
+                        brand=item.get("brand") or "",
+                        price_rub=item.get("price_rub"),
+                        price_with_plus=item.get("price_with_plus"),
+                        price_original_rub=item.get("price_old_rub"),
+                        rating=item.get("rating"),
+                        rating_count=item.get("rating_count"),
+                        legal_text="Реклама. ООО «ЯНДЕКС МАРКЕТ», ИНН: 9704254424",
+                        promo_badge="",
+                        aspect="3:4",
+                    )
+                    if styled:
+                        img = styled
+                        logger.info(
+                            "Yandex referral: карточка отрендерена (промокод=%s)",
+                            item.get("promo_code"),
+                        )
+                except Exception as e:
+                    logger.warning("Yandex referral: рендер карточки упал: %s", e)
+
+                # === 3. Отправляем в Telegram ===
                 try:
                     await bot.send_photo(
                         chat_id=TELEGRAM_GROUP_ID,

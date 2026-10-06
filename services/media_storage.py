@@ -13,7 +13,6 @@ PHOTOS_DIR = MEDIA_ROOT / "photos"
 VIDEOS_DIR = MEDIA_ROOT / "videos"
 MUSIC_DIR = MEDIA_ROOT / "music"
 
-
 def ensure_dirs() -> None:
     for d in (PHOTOS_DIR, VIDEOS_DIR, MUSIC_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -45,3 +44,16 @@ def save_photo(data: bytes, url: str, source: str) -> Optional[str]:
     except Exception as e:
         logger.warning("media: не удалось сохранить фото %s: %s", url, e)
         return None
+
+
+def delete_photo(path: str) -> bool:
+    """Удаляет файл фото с диска. Возвращает True, если файл удалён или не существовал."""
+    try:
+        p = Path(path)
+        if p.exists():
+            p.unlink()
+            logger.info("media: файл удалён %s", p.name)
+        return True
+    except Exception as e:
+        logger.warning("media: не удалось удалить %s: %s", path, e)
+        return False

@@ -117,15 +117,24 @@ class PublishedReferralProduct(Base):
 
 
 class PublishedMedia(Base):
-    """Фото, опубликованные в Telegram — источник для VK-видео."""
-
     __tablename__ = "published_media"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     product_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     price_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_with_plus: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_original_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rating: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rating_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    legal_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # === Промокод ===
+    promo_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    promo_percent: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     post_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_path: Mapped[str] = mapped_column(Text, nullable=False)
     image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -417,19 +426,34 @@ async def save_media(
     source: str,
     image_path: str,
     title: Optional[str] = None,
+    brand: Optional[str] = None,
     price_rub: Optional[float] = None,
+    price_with_plus: Optional[float] = None,
+    price_original_rub: Optional[float] = None,
+    rating: Optional[float] = None,
+    rating_count: Optional[int] = None,
+    legal_text: Optional[str] = None,
+    promo_code: Optional[str] = None,          # <-- NEW
+    promo_percent: Optional[int] = None,       # <-- NEW
     post_text: Optional[str] = None,
     image_url: Optional[str] = None,
     product_id: Optional[int] = None,
 ) -> int:
-    """Сохранить факт публикации фото."""
     session_maker = get_session_maker()
     async with session_maker() as session:
         media = PublishedMedia(
             source=source,
             product_id=product_id,
             title=title,
+            brand=brand,
             price_rub=price_rub,
+            price_with_plus=price_with_plus,
+            price_original_rub=price_original_rub,
+            rating=rating,
+            rating_count=rating_count,
+            legal_text=legal_text,
+            promo_code=promo_code,
+            promo_percent=promo_percent,
             post_text=post_text,
             image_path=image_path,
             image_url=image_url,
@@ -485,29 +509,59 @@ async def update_published_video(video_id: int, **fields) -> None:
         await session.commit()
 
 
-async def mark_media_as_used(video_id: int, media_ids: List[int]) -> None:
-    if not media_ids:
-        return
+async def cleanup_old_media(days: int = 30) -> int:
+    """Удаляет старые записи + файлы. Возвращает число удалённых записей."""
+    from services.media_storage import delete_photo  # локальный импорт, чтобы не было цикла
+
     session_maker = get_session_maker()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
     async with session_maker() as session:
+        # Сначала соберём пути к файлам
         stmt = (
-            update(PublishedMedia)
-            .where(PublishedMedia.id.in_(media_ids))
-            .values(video_id=video_id)
+            select(PublishedMedia.image_path)
+            .where(PublishedMedia.created_at < cutoff)
+            .where(PublishedMedia.video_id.isnot(None))
         )
-        await session.execute(stmt)
+        rows = await session.execute(stmt)
+        paths = [r[0] for r in rows.all() if r[0]]
+
+        # Удаляем записи
+        del_stmt = (
+            delete(PublishedMedia)
+            .where(PublishedMedia.created_at < cutoff)
+            .where(PublishedMedia.video_id.isnot(None))
+        )
+        result = await session.execute(del_stmt)
         await session.commit()
 
+    # Удаляем файлы (после коммита — если что-то упадёт, хотя бы БД чистая)
+    for p in paths:
+        delete_photo(p)
 
-async def cleanup_old_media(days: int = 30) -> int:
-    """Удаляет записи о медиа старше N дней."""
+    return result.rowcount or 0
+
+
+async def delete_media_records(media_ids: List[int]) -> int:
+    """Удаляет записи о медиа из БД по списку id."""
+    if not media_ids:
+        return 0
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = delete(PublishedMedia).where(PublishedMedia.id.in_(media_ids))
+        result = await session.execute(stmt)
+        await session.commit()
+        return result.rowcount or 0
+
+
+async def cleanup_old_referral_publications(days: int = 7) -> int:
+    """Удаляет старые записи о публикациях, чтобы товары снова попали в ротацию."""
     session_maker = get_session_maker()
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     async with session_maker() as session:
         stmt = (
-            delete(PublishedMedia)
-            .where(PublishedMedia.created_at < cutoff)
-            .where(PublishedMedia.video_id.isnot(None))
+            delete(PublishedReferralProduct)
+            .where(PublishedReferralProduct.published_at < cutoff)
         )
         result = await session.execute(stmt)
         await session.commit()

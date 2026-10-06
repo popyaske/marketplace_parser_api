@@ -294,7 +294,11 @@ async def _send_to_telegram(item: dict) -> None:
                             source="daily_publisher",
                             image_path=local_path,
                             title=item.get("title"),
-                            price_rub=item.get("price"),
+                            brand=item.get("store_title") or "",
+                            price_rub=_to_float(item.get("price")),
+                            price_with_plus=_to_float(item.get("price_discount")),
+                            price_original_rub=None,
+                            legal_text=item.get("legal_text"),
                             post_text=post_text,
                             image_url=image_url,
                         )

@@ -35,3 +35,7 @@ class ProductData:
     success: bool = True
     error: Optional[str] = None
     tier_used: str = ""   # curl_cffi, cdp, ssr, api
+
+    # === Промокод ===
+    promo_code: Optional[str] = None  # 'HOME15C'
+    promo_percent: Optional[int] = None  # 15
