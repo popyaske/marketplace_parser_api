@@ -1,5 +1,5 @@
 """
-Скрапер трендовых хештегов VK для Клипов.
+Скрапер трендовых хештегов и треков VK для Клипов.
 Источник: https://vk.ru/trending
 
 ВАЖНО: реальный контент живёт в IFRAME:
@@ -12,8 +12,9 @@
   2. Подключаемся к его webSocketDebuggerUrl.
   3. Никакой навигации не делаем — iframe уже на нужной странице.
   4. Ждём появления ссылок /hashtag/ (React рендерит их асинхронно).
-  5. Извлекаем хештеги.
-  6. Для стр.2 — клик по кнопке пагинации внутри iframe.
+  5. Извлекаем хештеги ТОЛЬКО из секции #хештеги.
+  6. Кликаем «вперёд» ТОЛЬКО внутри #хештеги (там своя пагинация)
+     и ждём фактической смены активной страницы.
 """
 import json
 import logging
@@ -27,13 +28,27 @@ logger = logging.getLogger(__name__)
 VK_TRENDING_URL = "https://vk.ru/trending"
 VKLANDING_DOMAIN = "vklanding.com"
 
+# Сколько ждать смены активной страницы после клика «вперёд»
+PAGE_CHANGE_TIMEOUT = 6.0
+PAGE_CHANGE_POLL = 0.25
 
-# === JS-скрипты ===
 
+# ============================================================
+# JS-скрипты
+# ============================================================
+
+# Извлекает хештеги ТОЛЬКО из секции #хештеги
 _JS_EXTRACT = r"""
 (() => {
+    const section = document.getElementById('хештеги');
+    if (!section) {
+        // fallback — весь документ, если секции нет
+        var scope = document;
+    } else {
+        var scope = section;
+    }
     const out = new Set();
-    document.querySelectorAll('a[href*="/hashtag/"]').forEach(a => {
+    scope.querySelectorAll('a[href*="/hashtag/"]').forEach(a => {
         const h = a.getAttribute('href') || '';
         const m = h.match(/hashtag\/([^\/?#]+)/);
         if (!m) return;
@@ -42,19 +57,112 @@ _JS_EXTRACT = r"""
             if (tag && tag.length <= 50) out.add('#' + tag);
         } catch (e) {}
     });
-    document.querySelectorAll('span, div').forEach(el => {
-        if (el.children.length > 0) return;
-        const t = (el.textContent || '').trim();
-        if (t.startsWith('#') && t.length > 1 && t.length <= 50 && !t.includes(' ')) {
-            out.add(t);
-        }
-    });
     return JSON.stringify([...out]);
+})()
+"""
+
+# Текущая активная страница внутри секции #хештеги
+_JS_GET_CURRENT_PAGE = r"""
+(() => {
+    const section = document.getElementById('хештеги');
+    if (!section) return -1;
+    const nav = section.querySelector('nav[role="navigation"]');
+    if (!nav) return -1;
+    const active = nav.querySelector('[data-page][aria-current="true"]');
+    if (!active) return -1;
+    const n = parseInt(active.getAttribute('data-page'), 10);
+    return isNaN(n) ? -1 : n;
+})()
+"""
+
+# Клик по «вперёд» — ТОЛЬКО внутри секции #хештеги
+_JS_CLICK_NEXT = r"""
+(() => {
+    const section = document.getElementById('хештеги');
+    if (!section) return 'no_section';
+    const nav = section.querySelector('nav[role="navigation"]');
+    if (!nav) return 'no_nav';
+
+    // 1. Приоритет — кнопка «вперёд» (nextButtonContainer)
+    const nextContainer = nav.querySelector('.vkuiPagination__nextButtonContainer');
+    if (nextContainer) {
+        const btn = nextContainer.querySelector('button');
+        if (btn) {
+            const disabled = btn.disabled
+                || btn.classList.contains('vkuiButton__disabled');
+            if (disabled) return 'last_page';
+            btn.scrollIntoView({block: 'center'});
+            btn.click();
+            return 'clicked_next';
+        }
+    }
+
+    // 2. Fallback — клик по следующему data-page
+    const pages = [...nav.querySelectorAll('[data-page]')];
+    let current = 0;
+    for (const p of pages) {
+        if (p.getAttribute('aria-current') === 'true') {
+            current = parseInt(p.getAttribute('data-page'), 10) || 0;
+            break;
+        }
+    }
+    const targetPage = current + 1;
+    for (const p of pages) {
+        if (parseInt(p.getAttribute('data-page'), 10) === targetPage) {
+            p.scrollIntoView({block: 'center'});
+            p.click();
+            return 'clicked_page_' + targetPage;
+        }
+    }
+    return 'no_next_button';
+})()
+"""
+
+# Клик по «назад» / переход на первую страницу — ТОЛЬКО внутри #хештеги
+_JS_GO_TO_FIRST_PAGE = r"""
+(() => {
+    const section = document.getElementById('хештеги');
+    if (!section) return 'no_section';
+    const nav = section.querySelector('nav[role="navigation"]');
+    if (!nav) return 'no_nav';
+
+    // 1. Уже на 1-й?
+    const active = nav.querySelector('[data-page][aria-current="true"]');
+    if (active && active.getAttribute('data-page') === '1') {
+        return 'already_first';
+    }
+
+    // 2. Клик по кнопке «назад» (prevButtonContainer)
+    const prevContainer = nav.querySelector('.vkuiPagination__prevButtonContainer');
+    if (prevContainer) {
+        const btn = prevContainer.querySelector('button');
+        if (btn) {
+            const disabled = btn.disabled
+                || btn.classList.contains('vkuiButton__disabled');
+            if (!disabled) {
+                btn.scrollIntoView({block: 'center'});
+                btn.click();
+                return 'clicked_prev';
+            }
+        }
+    }
+
+    // 3. Fallback — клик по самой первой странице data-page="1"
+    for (const p of nav.querySelectorAll('[data-page]')) {
+        if (p.getAttribute('data-page') === '1') {
+            p.scrollIntoView({block: 'center'});
+            p.click();
+            return 'clicked_page_1';
+        }
+    }
+    return 'no_first_button';
 })()
 """
 
 _JS_DIAG = r"""
 (() => {
+    const section = document.getElementById('хештеги');
+    const nav = section ? section.querySelector('nav[role="navigation"]') : null;
     return JSON.stringify({
         href: location.href,
         title: document.title,
@@ -62,58 +170,37 @@ _JS_DIAG = r"""
         body_len: document.body ? document.body.innerText.length : -1,
         links_total: document.querySelectorAll('a').length,
         hashtag_slash: document.querySelectorAll('a[href*="/hashtag/"]').length,
-        data_pages: [...document.querySelectorAll('[data-page]')]
-                        .map(e => e.getAttribute('data-page')),
+        hashtag_in_section: section
+            ? section.querySelectorAll('a[href*="/hashtag/"]').length
+            : -1,
+        section_present: !!section,
+        nav_present: !!nav,
+        data_pages: nav
+            ? [...nav.querySelectorAll('[data-page]')]
+                .map(e => e.getAttribute('data-page'))
+            : [],
         has_login: !!document.querySelector('input[type="password"]'),
-        body_preview: document.body ? document.body.innerText.slice(0, 300) : null
+        body_preview: document.body
+            ? document.body.innerText.slice(0, 300)
+            : null,
     });
 })()
 """
 
-
-# Извлекает трендовые треки из блока "музыка в тренде" внутри iframe.
-# Возвращает [{artist, title, href, audio_id}].
+# Извлекает трендовые треки из блока «музыка в тренде»
 _JS_EXTRACT_MUSIC = r"""
 (() => {
-    const items = [];
+    const section = document.getElementById('музыка') || document;
+    const result = [];
     const seen = new Set();
 
-    // Для каждой ссылки /clips/music/<owner>_<audio> находим контейнер с метаданными
-    document.querySelectorAll('a[href*="/clips/music/"]').forEach(a => {
+    section.querySelectorAll('a[href*="/clips/music/"]').forEach(a => {
         const href = a.getAttribute('href') || '';
         const m = href.match(/clips\/music\/(-?\d+_\d+)/);
         if (!m) return;
         const audio_id = m[1];
         if (seen.has(audio_id)) return;
         seen.add(audio_id);
-
-        // Идём вверх по DOM, ищем контейнер, в котором есть текст артиста и названия
-        let container = a.closest('[class*="Music"], [class*="Track"], li, article, div');
-        // Пробуем подняться ещё раз, если первый контейнер — просто обёртка ссылки
-        for (let i = 0; i < 5 && container; i++) {
-            const texts = [...container.querySelectorAll('span, div, a')]
-                .filter(el => el.children.length === 0)
-                .map(el => (el.textContent || '').trim())
-                .filter(t => t && t.length > 0 && t.length < 100 &&
-                             !t.includes('смотреть') && !t.includes('клип'));
-            if (texts.length >= 1) {
-                // Обычно: [title] или [artist, title] — берём первые два
-                return texts;
-            }
-            container = container.parentElement;
-        }
-
-        // Fallback — просто сохраним ID
-        items.push({ audio_id, artist: '', title: '', href, raw: '' });
-    });
-
-    // Пересобираем результат с метаданными (второй проход)
-    const result = [];
-    document.querySelectorAll('a[href*="/clips/music/"]').forEach(a => {
-        const href = a.getAttribute('href') || '';
-        const m = href.match(/clips\/music\/(-?\d+_\d+)/);
-        if (!m) return;
-        const audio_id = m[1];
 
         let container = a.closest('div, li, article');
         for (let i = 0; i < 6 && container; i++) {
@@ -123,7 +210,6 @@ _JS_EXTRACT_MUSIC = r"""
                 .filter(t => t && t.length > 1 && t.length < 100 &&
                              !/^(смотреть|клипы|музыка|в тренде|страниц)/i.test(t));
 
-            // Отсеиваем служебные
             const clean = leaves.filter(t =>
                 !t.includes('Перейти') &&
                 !t.includes('следующ') &&
@@ -134,8 +220,8 @@ _JS_EXTRACT_MUSIC = r"""
             if (clean.length >= 2) {
                 result.push({
                     audio_id,
-                    artist: clean[1],
                     title: clean[0],
+                    artist: clean[1],
                     href,
                     raw: clean.slice(0, 2).join(' — '),
                 });
@@ -143,8 +229,8 @@ _JS_EXTRACT_MUSIC = r"""
             } else if (clean.length === 1) {
                 result.push({
                     audio_id,
-                    artist: '',
                     title: clean[0],
+                    artist: '',
                     href,
                     raw: clean[0],
                 });
@@ -153,11 +239,10 @@ _JS_EXTRACT_MUSIC = r"""
             container = container.parentElement;
         }
 
-        // Совсем fallback
         result.push({ audio_id, artist: '', title: '', href, raw: '' });
     });
 
-    // Дедупликация по audio_id с приоритетом заполненных метаданных
+    // Дедупликация с приоритетом заполненных метаданных
     const byId = {};
     result.forEach(r => {
         const cur = byId[r.audio_id];
@@ -169,31 +254,10 @@ _JS_EXTRACT_MUSIC = r"""
 })()
 """
 
-# Клик по кнопке «→» (next page) внутри iframe
-_JS_CLICK_NEXT = r"""
-(() => {
-    // Ищем ссылку/кнопку с aria-label "следующая страница"
-    const byAria = document.querySelector('button[aria-label*="следующую"], button[aria-label*="следующ"], [aria-label*="Следующая"]');
-    if (byAria) { byAria.scrollIntoView({block:'center'}); byAria.click(); return 'clicked_aria'; }
 
-    // Ищем по data-page = текущая + 1
-    const pages = [...document.querySelectorAll('[data-page]')]
-                    .map(e => parseInt(e.getAttribute('data-page'), 10))
-                    .filter(n => !isNaN(n));
-    if (pages.length) {
-        const next = Math.max(...pages);
-        const btn = document.querySelector('[data-page="' + next + '"]');
-        if (btn) { btn.scrollIntoView({block:'center'}); btn.click(); return 'clicked_page_' + next; }
-    }
-
-    // Fallback — скролл вниз
-    window.scrollTo(0, document.body.scrollHeight);
-    return 'scrolled';
-})()
-"""
-
-
-# === CDP helpers ===
+# ============================================================
+# CDP helpers
+# ============================================================
 
 def _cdp_list_targets(cdp_host: str, cdp_port: int) -> List[dict]:
     """Возвращает список всех targets (вкладок, iframe, воркеров)."""
@@ -207,10 +271,7 @@ def _cdp_list_targets(cdp_host: str, cdp_port: int) -> List[dict]:
 
 
 def _pick_vklanding_iframe(targets: List[dict]) -> Optional[dict]:
-    """
-    Находит iframe vklanding.com — там живут хештеги.
-    Если iframe нет — возвращает None.
-    """
+    """Находит iframe vklanding.com — там живут хештеги."""
     for t in targets:
         if t.get("type") != "iframe":
             continue
@@ -221,7 +282,7 @@ def _pick_vklanding_iframe(targets: List[dict]) -> Optional[dict]:
 
 
 def _pick_vk_page_fallback(targets: List[dict]) -> Optional[dict]:
-    """Fallback — обычная вкладка vk.ru, если iframe не найден."""
+    """Fallback — обычная вкладка vk.ru."""
     for t in targets:
         if t.get("type") != "page":
             continue
@@ -231,12 +292,14 @@ def _pick_vk_page_fallback(targets: List[dict]) -> Optional[dict]:
     return None
 
 
-# === Основная функция ===
+# ============================================================
+# Хештеги
+# ============================================================
 
 def fetch_vk_trending_hashtags_sync(
     cdp_host: str = "127.0.0.1",
     cdp_port: int = 9222,
-    pages: int = 2,
+    pages: int = 3,
     wait_sec: float = 30.0,
     per_page_wait: float = 3.0,
 ) -> List[str]:
@@ -245,9 +308,9 @@ def fetch_vk_trending_hashtags_sync(
 
     Args:
         cdp_host, cdp_port: адрес Chrome CDP.
-        pages: сколько страниц собрать (1 = только первая, 2 = первая + вторая).
+        pages: сколько страниц собрать.
         wait_sec: сколько ждать появления ссылок.
-        per_page_wait: пауза после клика «следующая страница».
+        per_page_wait: пауза после клика «следующая страница» (страховка).
     """
     try:
         from websocket import create_connection
@@ -259,11 +322,9 @@ def fetch_vk_trending_hashtags_sync(
     if not targets:
         return []
 
-    # Приоритет 1 — iframe vklanding.com
     target = _pick_vklanding_iframe(targets)
     is_iframe = target is not None
 
-    # Приоритет 2 — обычная вкладка vk.ru (fallback, работает плохо)
     if target is None:
         target = _pick_vk_page_fallback(targets)
         if target is not None:
@@ -280,7 +341,7 @@ def fetch_vk_trending_hashtags_sync(
         return []
 
     logger.info(
-        "vk_trending: использую target id=%s type=%s url=%s",
+        "vk_trending: target id=%s type=%s url=%s",
         target.get("id"), target.get("type"), (target.get("url") or "")[:140],
     )
 
@@ -292,7 +353,8 @@ def fetch_vk_trending_hashtags_sync(
         ws = create_connection(target["webSocketDebuggerUrl"], timeout=30.0)
         msg_id = [0]
 
-        def send(method: str, params: Optional[dict] = None, timeout_s: float = 20.0) -> dict:
+        def send(method: str, params: Optional[dict] = None,
+                 timeout_s: float = 20.0) -> dict:
             msg_id[0] += 1
             cur = msg_id[0]
             payload = {"id": cur, "method": method}
@@ -326,16 +388,14 @@ def fetch_vk_trending_hashtags_sync(
         send("Page.enable")
 
         if not is_iframe:
-            # Только для fallback-вкладки vk.ru — принудительная навигация
             logger.info("vk_trending: hard reload → %s", VK_TRENDING_URL)
             send("Page.navigate", {"url": "about:blank"}, timeout_s=5.0)
             time.sleep(1.0)
             send("Page.navigate", {"url": VK_TRENDING_URL}, timeout_s=10.0)
         else:
-            # Для iframe НЕ делаем навигацию — React уже загружен
             logger.info("vk_trending: работаю внутри iframe, жду ссылки")
 
-        # Polling: ждём ссылок на хештеги
+        # Ждём появления ссылок на хештеги
         start = time.monotonic()
         found = False
         while time.monotonic() - start < wait_sec:
@@ -344,8 +404,10 @@ def fetch_vk_trending_hashtags_sync(
                 timeout_s=3.0,
             )
             if isinstance(cnt, int) and cnt > 0:
-                logger.info("vk_trending: ссылки появились (%d) за %.1f сек",
-                            cnt, time.monotonic() - start)
+                logger.info(
+                    "vk_trending: ссылки появились (%d) за %.1f сек",
+                    cnt, time.monotonic() - start,
+                )
                 found = True
                 break
             time.sleep(0.5)
@@ -355,7 +417,32 @@ def fetch_vk_trending_hashtags_sync(
 
         time.sleep(1.0)
 
-        # Собираем хештеги со страниц
+        # === Принудительно возвращаемся на 1-ю страницу ===
+        current_page_before = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=5.0)
+        logger.info("vk_trending: активная стр. перед стартом — %s", current_page_before)
+
+        if current_page_before and current_page_before > 1:
+            logger.info("vk_trending: возвращаюсь на стр.1...")
+            go_status = evaluate(_JS_GO_TO_FIRST_PAGE, timeout_s=5.0)
+            logger.info("vk_trending: переход на стр.1 → %s", go_status)
+
+            # Ждём смены активной страницы на 1
+            deadline = time.monotonic() + PAGE_CHANGE_TIMEOUT
+            while time.monotonic() < deadline:
+                time.sleep(PAGE_CHANGE_POLL)
+                cur = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
+                if cur == 1:
+                    logger.info("vk_trending: вернулся на стр.1 ✅")
+                    break
+            else:
+                logger.warning("vk_trending: не удалось вернуться на стр.1, "
+                               "собираю что есть")
+
+            # Даём React перерисовать список
+            time.sleep(0.7)
+
+        logger.info("vk_trending: старт сбора со стр.1")
+
         for page_num in range(1, pages + 1):
             raw = evaluate(_JS_EXTRACT, timeout_s=10.0)
             try:
@@ -378,17 +465,43 @@ def fetch_vk_trending_hashtags_sync(
             if page_num >= pages:
                 break
 
+            # Кликаем «вперёд» и ждём смены активной страницы
+            cur_before = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=5.0)
             status = evaluate(_JS_CLICK_NEXT, timeout_s=5.0)
-            logger.info("vk_trending: переход на стр.%d → %s", page_num + 1, status)
+            logger.info(
+                "vk_trending: клик «вперёд» (стр.%s) → %s",
+                cur_before, status,
+            )
 
-            if status in (None, "None"):
-                logger.warning("vk_trending: не удалось перейти на стр.%d", page_num + 1)
+            if status in ("last_page", "no_next_button", "no_section", "no_nav"):
+                logger.info("vk_trending: дошли до конца пагинации, стоп")
                 break
 
-            # Ждём обновления DOM (счётчик ссылок меняется)
-            time.sleep(per_page_wait)
+            # Ждём фактической смены активной страницы
+            changed = False
+            deadline = time.monotonic() + PAGE_CHANGE_TIMEOUT
+            while time.monotonic() < deadline:
+                time.sleep(PAGE_CHANGE_POLL)
+                cur_now = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
+                if cur_now != cur_before and cur_now != -1:
+                    changed = True
+                    logger.info(
+                        "vk_trending: страница сменилась %s → %s",
+                        cur_before, cur_now,
+                    )
+                    break
 
-        # Если хештегов 0 — снимаем диагностику
+            if not changed:
+                logger.warning(
+                    "vk_trending: страница не сменилась за %.1f сек, "
+                    "жду %.1f сек как fallback",
+                    PAGE_CHANGE_TIMEOUT, per_page_wait,
+                )
+                time.sleep(per_page_wait)
+
+            # Даём React перерисовать список
+            time.sleep(0.7)
+
         if not result:
             try:
                 diag_raw = evaluate(_JS_DIAG, timeout_s=10.0)
@@ -397,10 +510,13 @@ def fetch_vk_trending_hashtags_sync(
                         diag = json.loads(diag_raw)
                         logger.warning(
                             "vk_trending: 0 хештегов. Диагностика: %s",
-                            json.dumps(diag, ensure_ascii=False)[:1000],
+                            json.dumps(diag, ensure_ascii=False)[:1200],
                         )
                     except Exception:
-                        logger.warning("vk_trending: диагностика (raw): %s", str(diag_raw)[:1000])
+                        logger.warning(
+                            "vk_trending: диагностика (raw): %s",
+                            str(diag_raw)[:1200],
+                        )
             except Exception as e:
                 logger.warning("vk_trending: диагностика упала: %s", e)
 
@@ -413,9 +529,13 @@ def fetch_vk_trending_hashtags_sync(
             except Exception:
                 pass
 
-    logger.info("vk_trending: итог %d хештегов: %s", len(result), result[:15])
+    logger.info("vk_trending: итог %d хештегов: %s", len(result), result[:20])
     return result
 
+
+# ============================================================
+# Треки
+# ============================================================
 
 def fetch_vk_trending_tracks_sync(
     cdp_host: str = "127.0.0.1",
@@ -424,7 +544,6 @@ def fetch_vk_trending_tracks_sync(
     """
     Возвращает список трендовых треков VK с https://vk.ru/trending.
     Каждый элемент: {artist, title, raw, href, audio_id}.
-    Работает через CDP-подключение к iframe vklanding.com.
     """
     try:
         from websocket import create_connection
@@ -446,7 +565,8 @@ def fetch_vk_trending_tracks_sync(
         ws = create_connection(target["webSocketDebuggerUrl"], timeout=30.0)
         msg_id = [0]
 
-        def send(method: str, params: Optional[dict] = None, timeout_s: float = 20.0) -> dict:
+        def send(method: str, params: Optional[dict] = None,
+                 timeout_s: float = 20.0) -> dict:
             msg_id[0] += 1
             cur = msg_id[0]
             payload = {"id": cur, "method": method}
@@ -478,8 +598,13 @@ def fetch_vk_trending_tracks_sync(
 
         send("Runtime.enable")
 
-        # Скроллим вниз, чтобы блок "музыка в тренде" точно был в DOM
-        evaluate("window.scrollTo(0, document.body.scrollHeight)", timeout_s=5.0)
+        # Скроллим к блоку «музыка»
+        evaluate(
+            "(() => { const s = document.getElementById('музыка'); "
+            "if (s) s.scrollIntoView({block: 'start'}); "
+            "else window.scrollTo(0, document.body.scrollHeight); })()",
+            timeout_s=5.0,
+        )
         time.sleep(2.0)
 
         raw = evaluate(_JS_EXTRACT_MUSIC, timeout_s=10.0)

@@ -536,11 +536,44 @@ class OzonParser(BaseParser):
                 if parsed.get("price_original") is None and dom_prices.get("price_original"):
                     parsed["price_original"] = dom_prices["price_original"]
 
+        card_price = parsed.get("card_price")  # 388₽ (зелёная)
+        regular_price = parsed.get("price")  # 431₽ (обычная)
+        original = parsed.get("price_original")  # 2800₽ (зачёркнутая)
+
+        if card_price and regular_price and card_price < regular_price:
+            # Основная — зелёная
+            main_price = card_price
+
+            # «Было» — зачёркнутая, если она есть и больше основной.
+            # Иначе — обычная (если больше основной).
+            if original and original > main_price:
+                old_price = original
+            elif regular_price > main_price:
+                old_price = regular_price
+            else:
+                old_price = None
+
+            plus_price = None
+            logger.info(
+                "ozon: main=%s₽ (Ozon Card), было=%s₽, "
+                "обычная=%s₽, зачёркнутая=%s₽",
+                main_price, old_price, regular_price, original,
+            )
+        else:
+            # Фолбэк — как было (без Ozon Card)
+            main_price = regular_price
+            old_price = original
+            plus_price = card_price
+            logger.info(
+                "ozon: main=%s₽ (обычная), было=%s₽, plus=%s₽",
+                main_price, old_price, plus_price,
+            )
+
         return ProductData(
             title=parsed.get("title") or "Не найдено",
-            price_rub=parsed.get("price"),
-            price_with_plus=parsed.get("card_price"),
-            price_original_rub=parsed.get("price_original"),
+            price_rub=main_price,
+            price_with_plus=plus_price,
+            price_original_rub=old_price,
             url=f"https://www.ozon.ru{path}",
             marketplace=self.marketplace,
             sku=self.extract_sku(url),

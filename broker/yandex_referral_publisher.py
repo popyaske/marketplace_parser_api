@@ -430,9 +430,8 @@ async def _send_to_telegram(item: dict, referral_link: str) -> None:
                         price_original_rub=item.get("price_old_rub"),
                         rating=item.get("rating"),
                         rating_count=item.get("rating_count"),
-                        legal_text="Реклама. ООО «ЯНДЕКС МАРКЕТ», ИНН: 9704254424",
                         promo_badge="",
-                        aspect="3:4",
+                        aspect="3:4.5",
                     )
                     if styled:
                         img = styled

@@ -2,8 +2,12 @@
 import json
 import logging
 import asyncio
+import time
 from typing import Optional
+from urllib.parse import urlparse
+import os
 
+import httpx
 import aio_pika
 
 from .connection import (
@@ -20,6 +24,163 @@ from core.formatters import PriceFormatter, TextGenerator
 logger = logging.getLogger(__name__)
 
 
+# Домены-редиректы, которые надо распаковать
+_SHORT_URL_PATTERNS = (
+    "ozon.ru/t/",
+    "wildberries.ru/redirect",
+    "ali.click",
+    "aliexpress.ru/i/",
+    "market.yandex.ru/redir",
+)
+
+
+def _cdp_available(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> bool:
+    """Проверяет, отвечает ли Chrome CDP."""
+    try:
+        r = httpx.get(f"http://{cdp_host}:{cdp_port}/json/version", timeout=2.0)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _cdp_expand_short_url(
+    url: str,
+    cdp_host: str = "127.0.0.1",
+    cdp_port: int = 9222,
+    timeout: float = 15.0,
+) -> str:
+    """
+    Распаковывает короткую ссылку через Chrome CDP.
+
+    Открывает URL в новой вкладке (или переиспользует существующую),
+    ждёт редиректа и возвращает финальный URL из document.location.href.
+    """
+    if not any(p in url for p in _SHORT_URL_PATTERNS):
+        return url
+
+    try:
+        from websocket import create_connection
+    except ImportError:
+        logger.warning("CDP: websocket-client не установлен, пропускаю распаковку")
+        return url
+
+    if not _cdp_available(cdp_host, cdp_port):
+        logger.warning("CDP: Chrome недоступен на %s:%s", cdp_host, cdp_port)
+        return url
+
+    ws = None
+    try:
+        # Ищем вкладку ozon.ru, если её нет — создаём новую
+        tabs = httpx.get(f"http://{cdp_host}:{cdp_port}/json/list", timeout=5.0).json()
+        tab = next(
+            (t for t in tabs
+             if t.get("type") == "page" and "ozon.ru" in (t.get("url") or "")),
+            None,
+        )
+
+        if not tab:
+            # Создаём новую вкладку с короткой ссылкой
+            new_tab = httpx.put(
+                f"http://{cdp_host}:{cdp_port}/json/new?{url}",
+                timeout=10.0,
+            )
+            if new_tab.status_code != 200:
+                logger.warning("CDP: не удалось создать вкладку для %s", url)
+                return url
+            tab = new_tab.json()
+            time.sleep(3.0)  # даём странице загрузиться
+        else:
+            # Используем существующую вкладку, навигируем на короткую ссылку
+            ws_url = tab.get("webSocketDebuggerUrl")
+            ws = create_connection(ws_url, timeout=timeout)
+            msg_id = [0]
+
+            def send(method, params=None, timeout_s=10.0):
+                msg_id[0] += 1
+                cur = msg_id[0]
+                payload = {"id": cur, "method": method}
+                if params:
+                    payload["params"] = params
+                ws.send(json.dumps(payload))
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    ws.settimeout(max(0.1, deadline - time.monotonic()))
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        return {}
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("id") == cur:
+                        return data
+                return {}
+
+            send("Page.enable")
+            send("Page.navigate", {"url": url}, timeout_s=5.0)
+            time.sleep(3.0)
+            final_url = (send("Runtime.evaluate", {
+                "expression": "document.location.href",
+                "returnByValue": True,
+            }).get("result") or {}).get("result", {}).get("value")
+            if final_url and "ozon.ru/product" in final_url:
+                logger.info("CDP: распаковал (сущ. вкладка) %s → %s", url, final_url)
+                return final_url
+            ws.close()
+            ws = None
+
+        # Если создали новую вкладку — читаем её URL
+        if tab.get("webSocketDebuggerUrl"):
+            ws_url = tab["webSocketDebuggerUrl"]
+            ws = create_connection(ws_url, timeout=timeout)
+            msg_id = [0]
+
+            def send(method, params=None, timeout_s=10.0):
+                msg_id[0] += 1
+                cur = msg_id[0]
+                payload = {"id": cur, "method": method}
+                if params:
+                    payload["params"] = params
+                ws.send(json.dumps(payload))
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    ws.settimeout(max(0.1, deadline - time.monotonic()))
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        return {}
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("id") == cur:
+                        return data
+                return {}
+
+            send("Runtime.enable")
+            for _ in range(10):
+                time.sleep(0.5)
+                final_url = (send("Runtime.evaluate", {
+                    "expression": "document.location.href",
+                    "returnByValue": True,
+                }).get("result") or {}).get("result", {}).get("value")
+                if final_url and "ozon.ru/product" in final_url:
+                    logger.info("CDP: распаковал (новая вкладка) %s → %s", url, final_url)
+                    return final_url
+
+    except Exception as e:
+        logger.warning("CDP: ошибка распаковки %s: %s", url, e)
+    finally:
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    return url
+
+
 async def process_url(url: str) -> dict:
     """
     Обработать один URL: выбрать парсер, спарсить, вернуть результат.
@@ -27,15 +188,24 @@ async def process_url(url: str) -> dict:
     Returns:
         dict с полями success, marketplace, title, price_rub, post_text, error
     """
+    original_url = url
+    url = url = await asyncio.to_thread(
+        _cdp_expand_short_url,
+        original_url,
+        cdp_host=os.getenv("CDP_HOST", "127.0.0.1"),
+        cdp_port=int(os.getenv("CDP_PORT", "9222")),
+    )
+
     factory = MarketplaceFactory()
 
     try:
         key, parser = factory.get_parser(url)
     except ValueError as e:
+        # Возможно после распаковки URL стал непонятным
         return {
             "success": False,
-            "url": url,
-            "error": str(e),
+            "url": original_url,
+            "error": f"{e} (после распаковки: {url})",
         }
 
     try:
@@ -67,11 +237,19 @@ async def process_url(url: str) -> dict:
     price_plus = PriceFormatter.format_price(str(data.price_with_plus)) if data.price_with_plus else None
     price_original = PriceFormatter.format_price(str(data.price_original_rub)) if data.price_original_rub else None
 
+    if original_url and original_url != url:
+        logger.info(
+            "В посте использую исходную ссылку: %s (вместо %s)",
+            original_url, data.url,
+        )
+    data.url = original_url
+
     post_text = TextGenerator.generate(data)
 
     return {
         "success": True,
         "url": url,
+        "resolved_url": url,
         "marketplace": key,
         "sku": data.sku,
         "title": data.title,

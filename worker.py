@@ -43,7 +43,7 @@ async def main():
                 run_telegram_consumer(),
                 run_health_server(),
                 #run_daily_publisher(),
-                run_yandex_referral_publisher(),
+                #run_yandex_referral_publisher(),
                 run_vk_digest_publisher(),
             )
         except KeyboardInterrupt:

@@ -110,11 +110,11 @@ services:
       VK_VIDEO_WIDTH: ${VK_VIDEO_WIDTH:-1080}
       VK_VIDEO_HEIGHT: ${VK_VIDEO_HEIGHT:-1920}
       VK_HASHTAGS: ${VK_HASHTAGS:-#скидки,#маркетплейсы,#промокоды}
-      VK_HASHTAGS_COUNT: ${VK_HASHTAGS_COUNT:-3}
+      VK_HASHTAGS_COUNT: ${VK_HASHTAGS_COUNT}
       VK_CHANNEL_LINK: ${VK_CHANNEL_LINK:-https://t.me/PromoMP1}
-      VK_HASHTAGS_SOURCE: ${VK_HASHTAGS_SOURCE:-trending}
-      VK_TRENDING_PAGES: ${VK_TRENDING_PAGES:-2}
-      VK_TRENDING_REFRESH_SEC: ${VK_TRENDING_REFRESH_SEC:-21600}
+      VK_HASHTAGS_SOURCE: ${VK_HASHTAGS_SOURCE}
+      VK_TRENDING_PAGES: ${VK_TRENDING_PAGES}
+      VK_TRENDING_REFRESH_SEC: ${VK_TRENDING_REFRESH_SEC}
 
     depends_on:
       rabbitmq:
@@ -128,6 +128,7 @@ services:
     volumes:
       - media-data:/app/media
       - ./music:/app/media/music
+      - ./fonts:/app/fonts
 
   frontend:
     build:

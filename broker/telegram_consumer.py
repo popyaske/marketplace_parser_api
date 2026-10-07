@@ -1,7 +1,19 @@
-"""Telegram-consumer: постит post_text + фото в канал."""
+"""
+Telegram-consumer: публикует результаты парсинга в ГРУППУ.
+
+Стиль и API бота — 1:1 с yandex_referral_publisher.py:
+  • AiohttpSession(proxy=(url, BasicAuth))
+  • TELEGRAM_GROUP_ID (fallback — TELEGRAM_CHANNEL_ID)
+
+Логика:
+  • Ozon → без рендера, шлётся оригинальное фото + post_text.
+  • Яндекс / WB / AliExpress → рендер карточки через overlay_maker.
+  • Оригинал фото всегда сохраняется в published_media (для VK-клипа).
+"""
 import json
 import logging
 import os
+from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -13,70 +25,196 @@ from aiogram.types import BufferedInputFile
 
 from .connection import broker, QUEUE_RESULTS_TELEGRAM
 from services.media_storage import save_photo
+from services.overlay_maker import render_product_card
 from db import save_media
 
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+TELEGRAM_GROUP_ID = (
+    os.getenv("TELEGRAM_GROUP_ID")
+    or os.getenv("TELEGRAM_CHANNEL_ID", "")
+)
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
+# Аспект карточки
+CARD_ASPECT = os.getenv("TELEGRAM_CARD_ASPECT", "3:4.5")
 
-async def _download_image(image_url: str) -> bytes | None:
-    """
-    Скачивает картинку по URL.
-    Возвращает байты или None при ошибке.
-    """
-    try:
-        # Для Telegram-прокси (SOCKS5) httpx не подходит напрямую,
-        # но картинки маркетплейсов доступны и без прокси.
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            r = await client.get(image_url)
-            r.raise_for_status()
-            return r.content
-    except Exception as e:
-        logger.warning(f"Не удалось скачать картинку {image_url}: {e}")
-        return None
+# Маркетплейсы, для которых рендер НЕ делаем
+NO_RENDER_MARKETPLACES = {"ozon"}
+
+# Юр. тексты
+LEGAL_TEXT = {
+    "ozon":        "Реклама. ООО «Интернет Решения», ИНН 7704217370",
+    "wildberries": "Реклама. ООО «Вайлдберриз», ИНН 7721546864",
+    "yandex":      "Реклама. ООО «ЯНДЕКС МАРКЕТ», ИНН 9704254424",
+    "aliexpress":  "Реклама. ООО «АЛИБАБА.КОМ (РУ)», ИНН 7715067263",
+}
 
 
-def _image_filename(image_url: str) -> str:
-    """Определяет имя файла по URL."""
-    url_low = image_url.lower()
-    if ".jpg" in url_low or ".jpeg" in url_low:
-        return "product.jpg"
-    if ".png" in url_low:
-        return "product.png"
-    if ".webp" in url_low:
-        return "product.webp"
-    return "product.jpg"
+# ============================================================
+# Telegram (1:1 с yandex_referral_publisher.py)
+# ============================================================
 
-
-async def run_telegram_consumer():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-        logger.warning("TELEGRAM_BOT_TOKEN или TELEGRAM_CHANNEL_ID не заданы, пропускаю")
-        return
-
-    await broker.connect()
-
-    # === Настройка прокси для Telegram ===
+def _make_bot() -> Bot:
     if TELEGRAM_PROXY_URL:
-        logger.info(f"Использую прокси для Telegram: {TELEGRAM_PROXY_URL}")
         parsed = urlparse(TELEGRAM_PROXY_URL)
-        auth = None
-        if parsed.username and parsed.password:
-            auth = BasicAuth(login=parsed.username, password=parsed.password)
+        auth = (
+            BasicAuth(login=parsed.username, password=parsed.password)
+            if parsed.username and parsed.password else None
+        )
         proxy_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
         session = AiohttpSession(proxy=(proxy_url, auth))
     else:
         session = AiohttpSession()
+    return Bot(token=TELEGRAM_BOT_TOKEN, session=session)
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN, session=session)
+
+async def _download_image(url: str) -> Optional[bytes]:
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as c:
+            r = await c.get(url)
+            r.raise_for_status()
+            return r.content
+    except Exception as e:
+        logger.warning("telegram_consumer: не удалось скачать фото %s: %s", url, e)
+        return None
+
+
+async def _send_to_telegram(data: dict) -> None:
+    """Отправляет пост в группу с фото (карточка или оригинал) + текст."""
+    url = data.get("url", "?")
+    image_url = data.get("image_url")
+    post_text = data.get("post_text") or ""
+    marketplace = (data.get("marketplace") or "").lower()
+
+    if not post_text:
+        logger.warning("telegram_consumer: нет post_text — %s", url)
+        return
+
+    bot = _make_bot()
+    try:
+        if image_url:
+            img = await _download_image(image_url)
+            if img:
+                # === 1. Сохраняем ОРИГИНАЛ для VK-клипа ===
+                try:
+                    local_path = save_photo(
+                        img, image_url, source="telegram_consumer"
+                    )
+                    if local_path:
+                        await save_media(
+                            source="telegram_consumer",
+                            image_path=local_path,
+                            title=data.get("title"),
+                            brand=data.get("brand")
+                                  or data.get("seller") or "",
+                            price_rub=data.get("price_rub"),
+                            price_with_plus=data.get("price_with_plus"),
+                            price_original_rub=data.get("price_original_rub"),
+                            rating=data.get("rating"),
+                            rating_count=data.get("rating_count"),
+                            legal_text=LEGAL_TEXT.get(marketplace, ""),
+                            post_text=post_text,
+                            image_url=image_url,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "telegram_consumer: не удалось сохранить оригинал: %s", e
+                    )
+
+                # === 2. Рендерим карточку — только если НЕ в NO_RENDER ===
+                if marketplace not in NO_RENDER_MARKETPLACES:
+                    try:
+                        styled = render_product_card(
+                            img,
+                            title=data.get("title") or "",
+                            brand=data.get("brand") or "",
+                            price_rub=data.get("price_rub"),
+                            price_with_plus=data.get("price_with_plus"),
+                            price_original_rub=data.get("price_original_rub"),
+                            rating=data.get("rating"),
+                            rating_count=data.get("rating_count"),
+                            legal_text=LEGAL_TEXT.get(marketplace, ""),
+                            promo_badge="",
+                            aspect=CARD_ASPECT,
+                        )
+                        if styled:
+                            img = styled
+                            logger.info(
+                                "telegram_consumer: карточка отрендерена (%s)",
+                                CARD_ASPECT,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "telegram_consumer: рендер карточки упал: %s", e
+                        )
+                else:
+                    logger.info(
+                        "telegram_consumer: %s — шлю оригинал без рендера",
+                        marketplace,
+                    )
+
+                # === 3. Отправляем в Telegram ===
+                try:
+                    await bot.send_photo(
+                        chat_id=TELEGRAM_GROUP_ID,
+                        photo=BufferedInputFile(img, filename="product.jpg"),
+                        caption=post_text[:1024],
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                    logger.info(
+                        "telegram_consumer: пост с фото отправлен — %s", url
+                    )
+                    return
+                except Exception as e:
+                    logger.warning(
+                        "telegram_consumer: send_photo упал: %s. "
+                        "Шлю только текст.", e
+                    )
+
+        # Fallback — только текст
+        await bot.send_message(
+            chat_id=TELEGRAM_GROUP_ID,
+            text=post_text,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=False,
+        )
+        logger.info("telegram_consumer: пост (без фото) отправлен — %s", url)
+
+    finally:
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# Consumer
+# ============================================================
+
+async def run_telegram_consumer():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_GROUP_ID:
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN или TELEGRAM_GROUP_ID не заданы, "
+            "пропускаю telegram_consumer"
+        )
+        return
+
+    await broker.connect()
 
     channel = await broker.connection.channel()
     await channel.set_qos(prefetch_count=1)
     queue = await channel.declare_queue(QUEUE_RESULTS_TELEGRAM, durable=True)
 
-    logger.info(f"Telegram consumer запущен, слушает {QUEUE_RESULTS_TELEGRAM}")
+    logger.info(
+        "Telegram consumer запущен → группа %s, слушает %s",
+        TELEGRAM_GROUP_ID, QUEUE_RESULTS_TELEGRAM,
+    )
+    logger.info(
+        "Без рендера (оригинал): %s",
+        ", ".join(sorted(NO_RENDER_MARKETPLACES)) or "—",
+    )
 
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
@@ -85,81 +223,26 @@ async def run_telegram_consumer():
                     data = json.loads(message.body.decode())
                     url = data.get("url", "?")
 
-                    # === 1. Проверка успеха парсинга ===
+                    # === Фильтры ===
                     if not data.get("success"):
                         logger.info(f"Пропускаю (success=false): {url}")
                         continue
 
-                    # === 2. Проверка цены ===
                     price_rub = data.get("price_rub")
                     price_plus = data.get("price_with_plus")
                     if price_rub is None and price_plus is None:
-                        logger.warning(f"Пропускаю: цена не найдена для {url}")
+                        logger.warning(f"Пропускаю: цена не найдена — {url}")
                         continue
 
-                    # === 3. Проверка наличия ===
                     in_stock = data.get("in_stock")
                     if in_stock is False:
-                        logger.warning(f"Пропускаю: товара нет в наличии — {url}")
+                        logger.warning(
+                            f"Пропускаю: товара нет в наличии — {url}"
+                        )
                         continue
 
-                    # === 4. Проверка текста ===
-                    post_text = data.get("post_text")
-                    if not post_text:
-                        logger.warning(f"Пропускаю: нет post_text — {url}")
-                        continue
-
-                    # === 5. Отправка в Telegram ===
-                    image_url = data.get("image_url")
-
-                    if image_url:
-                        # Скачиваем картинку и отправляем как файл
-                        img_bytes = await _download_image(image_url)
-                        if img_bytes:
-                            # Сохраняем фото для будущего VK-клипа
-                            try:
-                                local_path = save_photo(img_bytes, image_url, source="telegram_consumer")
-                                if local_path:
-                                    await save_media(
-                                        source="telegram_consumer",
-                                        image_path=local_path,
-                                        title=data.get("title"),
-                                        brand=data.get("brand") or data.get("seller") or "",
-                                        price_rub=data.get("price_rub"),
-                                        price_with_plus=data.get("price_with_plus"),
-                                        price_original_rub=data.get("price_original_rub"),
-                                        rating=data.get("rating"),
-                                        rating_count=data.get("rating_count"),
-                                        post_text=post_text,
-                                        image_url=image_url,
-                                    )
-                            except Exception as e:
-                                logger.warning(f"Не удалось сохранить фото для VK: {e}")
-
-                            try:
-                                await bot.send_photo(
-                                    chat_id=TELEGRAM_CHANNEL_ID,
-                                    photo=BufferedInputFile(
-                                        img_bytes,
-                                        filename=_image_filename(image_url),
-                                    ),
-                                    caption=post_text[:1024],
-                                    parse_mode=ParseMode.MARKDOWN,
-                                )
-                                logger.info(f"Пост с фото отправлен: {url}")
-                                continue
-                            except Exception as e:
-                                logger.warning(f"send_photo упал: {e}. Отправляю только текст.")
-                        else:
-                            logger.warning(f"Картинка не скачалась, отправляю только текст: {url}")
-
-                    # Fallback — только текст
-                    await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID,
-                        text=post_text,
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-                    logger.info(f"Пост отправлен (без фото): {url}")
+                    # === Публикация ===
+                    await _send_to_telegram(data)
 
                 except Exception as e:
                     logger.exception(f"Ошибка обработки сообщения: {e}")

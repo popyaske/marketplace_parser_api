@@ -80,8 +80,7 @@ async def run_vk_digest_publisher():
         VK_DIGEST_INTERVAL, VK_DIGEST_INTERVAL / 3600.0,
         VK_PHOTOS_PER_VIDEO, VK_PHOTO_DURATION, VK_VIDEO_WIDTH, VK_VIDEO_HEIGHT,
     )
-
-    asyncio.create_task(_refresh_trending_hashtags())
+    await _refresh_trending_hashtags()
     last_hashtags_refresh = time.monotonic()
 
     while True:

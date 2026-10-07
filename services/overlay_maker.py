@@ -1,19 +1,21 @@
 """
-Карточка товара в стиле Яндекс.Маркета (без верхней плашки).
+Карточка товара в стиле Яндекс.Маркета.
+
+Рендер 1:1 совпадает с scripts/card_tuner.py.
+Параметры подобраны в тюнере и перенесены сюда как константы.
 
 Структура:
-  1. Фото товара на весь кадр (кроме нижнего белого блока).
-  2. Красное сердце в правом верхнем углу фото.
-  3. Маленький тёмный бейдж (опц.) слева от сердца — напр. «24 шт. x 0,5».
-  4. Красный бейдж «НИЖЕ РЫНКА» в левом нижнем углу фото.
-  5. Белый блок внизу: название товара, зелёная цена + иконка Пэй, юр. текст.
+  1. Фото с отступом от краёв, скруглённые углы.
+  2. Красное сердечко (параметрическая кривая) в правом верхнем углу.
+  3. Оранжевый бейдж «НИЖЕ РЫНКА» — левый нижний угол фото.
+  4. Белый блок: название (2 строки, слева) + крупная цена + «Пэй».
 
-Два формата:
-  aspect='3:4'  — 1080×1440 для Telegram
-  aspect='9:16' — 1080×1920 для VK Клипов
+Аспекты: 3:4 | 3:4.5 | 3:5 | 4:5 | 9:16
 """
 import io
 import logging
+import math
+import os
 from pathlib import Path
 from typing import Optional, Union
 
@@ -21,22 +23,88 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
-FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# ============================================================
+# Шрифты
+# ============================================================
+FONTS_DIR = os.getenv("FONTS_DIR", "/app/fonts")
+
+_YS_REGULAR     = f"{FONTS_DIR}/YSText-Regular.ttf"
+_YS_BOLD        = f"{FONTS_DIR}/YSText-Bold.ttf"
+_YS_BOLD_ITALIC = f"{FONTS_DIR}/YSText-BoldItalic.ttf"
+
+_DEJAVU_REGULAR     = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD        = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_DEJAVU_BOLD_ITALIC = "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf"
+
+
+def _pick_font(primary: str, fallback: str) -> str:
+    return primary if Path(primary).exists() else fallback
+
+
+FONT_REGULAR     = _pick_font(_YS_REGULAR,     _DEJAVU_REGULAR)
+FONT_BOLD        = _pick_font(_YS_BOLD,        _DEJAVU_BOLD)
+FONT_BOLD_ITALIC = _pick_font(_YS_BOLD_ITALIC, _DEJAVU_BOLD_ITALIC)
+
+logger.info(
+    "overlay: шрифты → regular=%s, bold=%s, italic=%s",
+    Path(FONT_REGULAR).name, Path(FONT_BOLD).name, Path(FONT_BOLD_ITALIC).name,
+)
+
 
 # === Цвета ===
-COLOR_WHITE = (255, 255, 255, 255)
-COLOR_BLACK = (15, 15, 15, 255)
-COLOR_TEXT_DARK = (26, 26, 26, 255)
-COLOR_TEXT_LIGHT_GRAY = (170, 170, 170, 255)
-COLOR_PRICE_GREEN = (0, 178, 87, 255)
-COLOR_HEART_RED = (240, 60, 60, 255)
-COLOR_BADGE_RED = (232, 60, 40, 255)          # «НИЖЕ РЫНКА»
-COLOR_BADGE_SMALL_BG = (40, 40, 40, 220)      # тёмный полупрозрачный для «24 шт»
+COLOR_WHITE          = (255, 255, 255, 255)
+COLOR_BG             = (255, 255, 255, 255)
+COLOR_TEXT_PRIMARY   = (25, 24, 23, 255)      # #191817
+COLOR_TEXT_SECONDARY = (140, 138, 135, 255)
+COLOR_PRICE_GREEN    = (38, 110, 56, 255)     # #266E38
+COLOR_BADGE_ORANGE   = (255, 96, 47, 255)     # #FF602F
+COLOR_HEART_RED      = (250, 62, 44, 255)     # #FA3E2C
+COLOR_HEART_OUTLINE  = (255, 255, 255, 255)
 
 
 # ============================================================
-# Утилиты
+# Размеры (эталон 1080×1440) — из card_tuner.py
+# ============================================================
+BASE_H              = 1440
+
+# Фото
+BASE_PHOTO_H        = 1125
+BASE_ROUND_RADIUS   = 81
+BASE_PHOTO_MARGIN   = 40
+
+# Название
+BASE_TITLE_FONT     = 56
+BASE_TITLE_LINE_H   = 1.14
+BASE_TITLE_TOP_PAD  = 24
+BASE_LEFT_PAD       = 80
+
+# Цена
+BASE_PRICE_FONT     = 94
+BASE_PRICE_TOP_GAP  = 4
+PRICE_ALIGN_LEFT    = True    # False → по центру
+
+# Полоска «Пэй»
+BASE_PAY_FONT       = 60
+BASE_PAY_BAR_W      = 78
+BASE_PAY_BAR_H      = 40
+BASE_PAY_GAP_1      = 28
+BASE_PAY_GAP_2      = 18
+
+# Бейдж «НИЖЕ РЫНКА»
+BASE_BADGE_FONT     = 57
+BASE_BADGE_LEFT     = 37
+BASE_BADGE_BOTTOM   = 108
+
+# Сердечко
+BASE_HEART_SIZE     = 42
+BASE_HEART_OUTLINE  = 0        # 0 = без обводки
+BASE_HEART_RIGHT    = 116
+BASE_HEART_TOP      = 106
+
+
+# ============================================================
+# Утилиты (совпадают с тюнером)
 # ============================================================
 
 def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -60,7 +128,6 @@ def _fmt_price(v: Optional[float]) -> str:
 
 
 def _wrap(draw, text, font, max_w, max_lines=2):
-    """Разбивает текст на строки, последнюю обрезает с …."""
     if not text:
         return []
     words = text.split()
@@ -97,7 +164,7 @@ def _open_image(src):
         return None
 
 
-def _crop_center(img: Image.Image, w: int, h: int) -> Image.Image:
+def _crop_cover(img: Image.Image, w: int, h: int) -> Image.Image:
     src_ratio = img.width / img.height
     tgt_ratio = w / h
     if src_ratio > tgt_ratio:
@@ -113,19 +180,63 @@ def _crop_center(img: Image.Image, w: int, h: int) -> Image.Image:
     return img.resize((w, h), Image.LANCZOS)
 
 
-def _draw_heart(draw, cx, cy, size, color):
-    """Рисует сердце в точке (cx, cy) с размером size."""
-    r = size // 2
-    draw.ellipse((cx - size, cy - size // 2, cx, cy + size // 2), fill=color)
-    draw.ellipse((cx, cy - size // 2, cx + size, cy + size // 2), fill=color)
-    draw.polygon(
-        [(cx - size, cy), (cx + size, cy), (cx, cy + size)],
-        fill=color,
+def _rounded_top_mask(w: int, h: int, radius: int) -> Image.Image:
+    """Скругление только верхних углов (photo_margin = 0)."""
+    mask = Image.new("L", (w, h), 255)
+    mdraw = ImageDraw.Draw(mask)
+    mdraw.rectangle((0, 0, radius, radius), fill=0)
+    mdraw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+    mdraw.rectangle((w - radius, 0, w, radius), fill=0)
+    mdraw.ellipse((w - radius * 2, 0, w, radius * 2), fill=255)
+    return mask
+
+
+def _heart_polygon(cx, cy, size, steps=200):
+    """Ровное сердечко через параметрическую кривую."""
+    pts = []
+    for i in range(steps):
+        t = 2 * math.pi * i / steps
+        x = 16 * math.sin(t) ** 3
+        y = -(13 * math.cos(t) - 5 * math.cos(2 * t)
+              - 2 * math.cos(3 * t) - math.cos(4 * t))
+        pts.append((cx + x * size / 16.0, cy + y * size / 16.0))
+    return pts
+
+
+def _draw_heart_smooth(draw, cx, cy, size, fill_color,
+                       outline_color=None, outline_w=0):
+    if outline_color and outline_w > 0:
+        draw.polygon(_heart_polygon(cx, cy, size + outline_w),
+                     fill=outline_color)
+    draw.polygon(_heart_polygon(cx, cy, size), fill=fill_color)
+
+
+def _draw_nizhe_rynka_badge(draw, x, y, font):
+    text = "НИЖЕ РЫНКА"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad_x, pad_y = 30, 10
+    badge_w = text_w + pad_x * 2
+    badge_h = text_h + pad_y * 2
+    radius = badge_h // 2
+    _rounded_rect(draw, (x, y, x + badge_w, y + badge_h), radius, COLOR_BADGE_ORANGE)
+    draw.text(
+        (x + pad_x - bbox[0], y + pad_y - bbox[1]),
+        text, font=font, fill=COLOR_WHITE,
+    )
+    return badge_w, badge_h
+
+
+def _draw_pay_bar(draw, x, y, width, height, radius=4):
+    draw.rounded_rectangle(
+        (x, y, x + width, y + height),
+        radius=radius, fill=COLOR_PRICE_GREEN,
     )
 
 
 # ============================================================
-# Основная функция рендера
+# Основная функция — 1:1 с render_card() в тюнере
 # ============================================================
 
 def render_product_card(
@@ -139,134 +250,154 @@ def render_product_card(
     rating_count: Optional[int] = None,
     legal_text: str = "",
     small_badge: str = "",
+    promo_badge: str = "",
     aspect: str = "3:4",
 ) -> Optional[bytes]:
-    """
-    Собирает карточку в стиле Яндекс.Маркета. Возвращает JPEG-байты.
-
-    Верхней цветной плашки нет — фото занимает всю площадь, кроме
-    нижнего белого блока.
-
-    Параметры:
-        small_badge — маленький бейдж справа сверху (напр. «24 шт. x 0,5»).
-        aspect      — '3:4' (1080×1440) для Telegram или '9:16' (1080×1920) для VK.
-    """
+    """3:4 | 3:4.5 | 3:5 | 4:5 | 9:16."""
     if aspect == "9:16":
         W, H = 1080, 1920
-        bottom_h = 440
+    elif aspect == "3:5":
+        W, H = 1080, 1800
+    elif aspect == "3:4.5":
+        W, H = 1080, 1620
+    elif aspect == "4:5":
+        W, H = 1080, 1350
     else:
         W, H = 1080, 1440
-        bottom_h = 380
+
+    s = H / BASE_H
+
+    photo_h        = int(BASE_PHOTO_H       * s)
+    round_radius   = int(BASE_ROUND_RADIUS  * s)
+    photo_margin   = int(BASE_PHOTO_MARGIN  * s)
+    title_font_px  = int(BASE_TITLE_FONT    * s)
+    title_top_pad  = int(BASE_TITLE_TOP_PAD * s)
+    left_pad       = int(BASE_LEFT_PAD      * s)
+    price_font_px  = int(BASE_PRICE_FONT    * s)
+    price_top_gap  = int(BASE_PRICE_TOP_GAP * s)
+    pay_font_px    = int(BASE_PAY_FONT      * s)
+    pay_bar_w      = int(BASE_PAY_BAR_W     * s)
+    pay_bar_h      = max(4, int(BASE_PAY_BAR_H * s))
+    pay_gap_1      = int(BASE_PAY_GAP_1     * s)
+    pay_gap_2      = int(BASE_PAY_GAP_2     * s)
+    badge_font_px  = int(BASE_BADGE_FONT    * s)
+    badge_left     = int(BASE_BADGE_LEFT    * s)
+    badge_bottom   = int(BASE_BADGE_BOTTOM  * s)
+    heart_size     = int(BASE_HEART_SIZE    * s)
+    heart_outline  = int(BASE_HEART_OUTLINE * s)
+    heart_right    = int(BASE_HEART_RIGHT   * s)
+    heart_top      = int(BASE_HEART_TOP     * s)
 
     img = _open_image(src)
     if img is None:
         return None
 
-    canvas = Image.new("RGBA", (W, H), COLOR_WHITE)
+    canvas = Image.new("RGB", (W, H), COLOR_BG)
 
-    # ============ 1. Фото на весь кадр (кроме нижнего блока) ============
-    photo_h = H - bottom_h
-    photo = _crop_center(img, W, photo_h)
-    canvas.paste(photo, (0, 0))
+    # ============================================================
+    # 1. ФОТО
+    # ============================================================
+    photo_w = W - photo_margin * 2
+    photo = _crop_cover(img, photo_w, photo_h)
+
+    if photo_margin > 0:
+        # Все 4 угла
+        mask = Image.new("L", (photo_w, photo_h), 0)
+        mdraw = ImageDraw.Draw(mask)
+        mdraw.rounded_rectangle(
+            (0, 0, photo_w, photo_h),
+            radius=round_radius, fill=255,
+        )
+    else:
+        mask = _rounded_top_mask(photo_w, photo_h, radius=round_radius)
+
+    canvas.paste(photo, (photo_margin, photo_margin), mask)
 
     draw = ImageDraw.Draw(canvas)
 
-    # ============ 2. Сердце — красное, в правом верхнем углу фото ============
-    heart_x = W - 90
-    heart_y = 80
-    _draw_heart(draw, heart_x, heart_y, 38, COLOR_HEART_RED)
+    # ============================================================
+    # 2. СЕРДЕЧКО (параметрическая кривая)
+    # ============================================================
+    _draw_heart_smooth(
+        draw,
+        cx=W - heart_right,
+        cy=heart_top,
+        size=heart_size,
+        fill_color=COLOR_HEART_RED,
+        outline_color=COLOR_HEART_OUTLINE if heart_outline > 0 else None,
+        outline_w=heart_outline,
+    )
 
-    # ============ 3. Маленький бейдж слева от сердца ============
-    if small_badge:
-        font_small = _font(FONT_REGULAR, 30)
-        bbox = draw.textbbox((0, 0), small_badge, font=font_small)
-        bw = bbox[2] - bbox[0] + 30
-        bh = bbox[3] - bbox[1] + 18
-        bx = heart_x - 80 - bw
-        by = 55
-        _rounded_rect(draw, (bx, by, bx + bw, by + bh), 10, COLOR_BADGE_SMALL_BG)
-        draw.text((bx + 15, by + 8), small_badge, font=font_small, fill=COLOR_WHITE)
-
-    # ============ 4. Красный бейдж «НИЖЕ РЫНКА» на фото ============
+    # ============================================================
+    # 3. БЕЙДЖ «НИЖЕ РЫНКА»
+    # ============================================================
     primary = price_with_plus if price_with_plus else price_rub
     old = price_original_rub
     if old and primary and old > primary:
-        b_text = "НИЖЕ РЫНКА"
-        font_b = _font(FONT_BOLD, 44)
-        bbox = draw.textbbox((0, 0), b_text, font=font_b)
-        bw = bbox[2] - bbox[0] + 44
-        bh = bbox[3] - bbox[1] + 26
-        bx = 45
-        by = photo_h - bh - 35
-        _rounded_rect(draw, (bx, by, bx + bw, by + bh), 10, COLOR_BADGE_RED)
-        draw.text((bx + 22, by + 12), b_text, font=font_b, fill=COLOR_WHITE)
-
-    # ============ 5. Нижний белый блок ============
-    block_y = H - bottom_h
-
-    # 5.1 Название товара — 2 строки, тёмный текст
-    font_title = _font(FONT_REGULAR, 44 if aspect == "9:16" else 40)
-    title_lines = _wrap(draw, title, font_title, W - 100, max_lines=2)
-    y = block_y + 40
-    for line in title_lines:
-        draw.text((50, y), line, font=font_title, fill=COLOR_TEXT_DARK)
-        y += int(font_title.size * 1.25)
-
-    # 5.2 Цена — большая зелёная + иконка Пэй
-    if primary is not None:
-        y += 20
-        font_price = _font(FONT_BOLD, 92 if aspect == "9:16" else 84)
-        price_str = _fmt_price(primary)
-        draw.text((50, y), price_str, font=font_price, fill=COLOR_PRICE_GREEN)
-        price_w = draw.textlength(price_str, font=font_price)
-
-        # Иконка «Пэй» — зелёная плашка с двумя белыми полосками
-        if price_with_plus:
-            icon_w, icon_h = 52, 36
-            icon_x = 50 + price_w + 24
-            icon_y = y + 30
-            _rounded_rect(
-                draw,
-                (icon_x, icon_y, icon_x + icon_w, icon_y + icon_h),
-                6, COLOR_PRICE_GREEN,
-            )
-            inner = 10
-            draw.rectangle(
-                (icon_x + inner, icon_y + 10,
-                 icon_x + icon_w - inner, icon_y + 14),
-                fill=COLOR_WHITE,
-            )
-            draw.rectangle(
-                (icon_x + inner, icon_y + 22,
-                 icon_x + icon_w - inner, icon_y + 26),
-                fill=COLOR_WHITE,
-            )
-            font_pay = _font(FONT_REGULAR, 38)
-            draw.text(
-                (icon_x + icon_w + 12, icon_y + 2),
-                "Пэй", font=font_pay, fill=COLOR_PRICE_GREEN,
-            )
-
-    # 5.3 Юр. текст — мелкий серый в самом низу
-    if legal_text:
-        font_legal = _font(FONT_REGULAR, 22)
-        draw.text(
-            (50, H - 32),
-            legal_text[:90], font=font_legal, fill=COLOR_TEXT_LIGHT_GRAY,
+        font_badge = _font(FONT_BOLD_ITALIC, badge_font_px)
+        badge_y = photo_margin + photo_h - badge_bottom
+        _draw_nizhe_rynka_badge(
+            draw,
+            x=photo_margin + badge_left,
+            y=badge_y,
+            font=font_badge,
         )
 
-    # ============ 6. Экспорт ============
+    # ============================================================
+    # 4. БЕЛЫЙ БЛОК
+    # ============================================================
+    block_y = photo_margin + photo_h
+    text_w = W - left_pad * 2
+
+    # 4.1 Название
+    font_title = _font(FONT_REGULAR, title_font_px)
+    title_lines = _wrap(draw, title, font_title, text_w, max_lines=2)
+    y = block_y + title_top_pad
+    line_h = int(title_font_px * BASE_TITLE_LINE_H)
+    for line in title_lines:
+        draw.text((left_pad, y), line, font=font_title, fill=COLOR_TEXT_PRIMARY)
+        y += line_h
+
+    # 4.2 Цена + «Пэй»
+    if primary is not None:
+        y += price_top_gap
+        font_price = _font(FONT_BOLD, price_font_px)
+        price_str = _fmt_price(primary)
+        price_w = draw.textlength(price_str, font=font_price)
+
+        if price_with_plus:
+            font_pay = _font(FONT_REGULAR, pay_font_px)
+            pay_text = "Пэй"
+            pay_w = draw.textlength(pay_text, font=font_pay)
+            total_w = price_w + pay_gap_1 + pay_bar_w + pay_gap_2 + pay_w
+        else:
+            total_w = price_w
+
+        start_x = left_pad if PRICE_ALIGN_LEFT else (W - total_w) / 2
+
+        draw.text(
+            (start_x, y), price_str,
+            font=font_price, fill=COLOR_PRICE_GREEN,
+        )
+
+        if price_with_plus:
+            bar_x = start_x + price_w + pay_gap_1
+            bar_y = y + int(price_font_px * 0.45)
+            _draw_pay_bar(draw, bar_x, bar_y, width=pay_bar_w, height=pay_bar_h)
+
+            pay_x = bar_x + pay_bar_w + pay_gap_2
+            pay_y = bar_y - int(pay_font_px * 0.30)
+            draw.text(
+                (pay_x, pay_y), pay_text,
+                font=font_pay, fill=COLOR_PRICE_GREEN,
+            )
+
     out = io.BytesIO()
-    canvas.convert("RGB").save(out, "JPEG", quality=90)
+    canvas.save(out, "JPEG", quality=92, optimize=True)
     return out.getvalue()
 
 
-def render_and_save(
-    src_path: str,
-    dst_path: str,
-    **kwargs,
-) -> bool:
-    """Рендер + сохранение в файл (для VK-видео)."""
+def render_and_save(src_path: str, dst_path: str, **kwargs) -> bool:
     data = render_product_card(src_path, **kwargs)
     if not data:
         return False
