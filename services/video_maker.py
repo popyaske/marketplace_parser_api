@@ -19,7 +19,7 @@ def create_slideshow(
     duration_per_photo: float = 3.0,
     width: int = 1080,
     height: int = 1920,
-    fps: int = 30,
+    fps: int = 60,
     music_path: Optional[str] = None,
 ) -> bool:
     """
@@ -54,19 +54,17 @@ def create_slideshow(
     for i in range(n):
         filter_parts.append(
             f"[{i}:v]"
-            f"scale={width*2}:{height*2}:force_original_aspect_ratio=increase,"
-            f"crop={width*2}:{height*2},"
-            f"zoompan=z='min(zoom+0.0008,1.15)':d={int(duration_per_photo*fps)}:"
-            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            f"s={width}x{height}:fps={fps},"
-            f"setsar=1[v{i}]"
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            f"setsar=1,"
+            f"fps={fps}[v{i}]"
         )
 
     # Переходы xfade между парами
     if n == 1:
         last_label = "v0"
     else:
-        fade = 0.5
+        fade = 0.3
         prev = "v0"
         for i in range(1, n):
             offset = i * duration_per_photo - fade * i

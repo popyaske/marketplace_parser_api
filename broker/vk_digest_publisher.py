@@ -39,6 +39,13 @@ VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "")
 VK_USER_ID = int(os.getenv("VK_USER_ID", "0") or 0)
 VK_CHANNEL_LINK = os.getenv("VK_CHANNEL_LINK", "https://t.me/PromoMP1")
 
+# === VK Stories ===
+VK_PUBLISH_STORY    = os.getenv("VK_PUBLISH_STORY", "0") == "1"     # вкл/выкл
+VK_STORY_GROUP_ID   = int(os.getenv("VK_STORY_GROUP_ID", "0") or 0) # 0 = от себя
+VK_STORY_LINK_TEXT  = os.getenv("VK_STORY_LINK_TEXT", "more")
+# Ссылка — берётся из VK_CHANNEL_LINK, либо отдельная VK_STORY_LINK_URL
+VK_STORY_LINK_URL   = os.getenv("VK_STORY_LINK_URL") or VK_CHANNEL_LINK
+
 # === Видео ===
 VK_DIGEST_INTERVAL = int(os.getenv("VK_DIGEST_INTERVAL", "86400"))       # сек
 VK_PHOTOS_PER_VIDEO = int(os.getenv("VK_PHOTOS_PER_VIDEO", "5"))
@@ -290,16 +297,15 @@ async def _make_and_upload_one():
         music_path=str(music_path) if music_path else None,
     )
     if not ok:
-        logger.error("VK digest: не удалось создать видео, фото оставляю")
+        logger.error("VK digest: не удалось создать видео, чищу styled и выхожу")
+        # Видео не собралось — стилизованные копии не нужны
+        for p in styled_paths:
+            if p.endswith("_styled.jpg"):
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
         return
-
-    # === Удаляем styled-копии после сборки видео ===
-    for p in styled_paths:
-        if p.endswith("_styled.jpg"):
-            try:
-                Path(p).unlink()
-            except Exception:
-                pass
 
     # Записываем факт создания видео
     video = await create_published_video(
@@ -317,6 +323,9 @@ async def _make_and_upload_one():
     try:
         vk = VKClient(VK_ACCESS_TOKEN, VK_USER_ID)
         try:
+            # ============================================================
+            # 1. Публикуем видео в VK Клипы
+            # ============================================================
             owner_id, vk_video_id = await asyncio.to_thread(
                 vk.upload_video,
                 str(video_path),
@@ -335,7 +344,65 @@ async def _make_and_upload_one():
                 owner_id, vk_video_id, len(photo_paths), duration,
             )
 
-            # === Успех → удаляем исходные фото ===
+            # ============================================================
+            # 2. Публикуем Историю (если включено)
+            #    В историю идёт ПЕРВЫЙ стилизованный кадр — он 9:16.
+            # ============================================================
+            if VK_PUBLISH_STORY and styled_paths:
+                try:
+                    story_img = styled_paths[0]
+                    if Path(story_img).exists():
+                        story = await asyncio.to_thread(
+                            vk.upload_story,
+                            story_img,
+                            add_to_news=True,
+                            group_id=VK_STORY_GROUP_ID,
+                            link_url=VK_STORY_LINK_URL,
+                            link_text=VK_STORY_LINK_TEXT,
+                        )
+                        logger.info(
+                            "VK digest: история опубликована "
+                            "(id=%s, owner_id=%s, url=%s)",
+                            story.get("id"),
+                            story.get("owner_id"),
+                            VK_STORY_LINK_URL,
+                        )
+                    else:
+                        logger.warning(
+                            "VK digest: файл для истории не найден: %s",
+                            story_img,
+                        )
+                except Exception as e:
+                    # Не валим основной поток, если история не удалась
+                    logger.warning(
+                        "VK digest: история не опубликована: %s", e
+                    )
+            else:
+                logger.info(
+                    "VK digest: история пропущена (VK_PUBLISH_STORY=%s)",
+                    VK_PUBLISH_STORY,
+                )
+
+            # ============================================================
+            # 3. Убираем styled-копии — они больше не нужны
+            # ============================================================
+            removed_styled = 0
+            for p in styled_paths:
+                if p.endswith("_styled.jpg"):
+                    try:
+                        Path(p).unlink()
+                        removed_styled += 1
+                    except Exception:
+                        pass
+            if removed_styled:
+                logger.info(
+                    "VK digest: удалено %d styled-копий",
+                    removed_styled,
+                )
+
+            # ============================================================
+            # 4. Убираем исходные фото
+            # ============================================================
             deleted_files = 0
             for m in media:
                 if delete_photo(m.image_path):
@@ -345,6 +412,29 @@ async def _make_and_upload_one():
                 "VK digest: удалено %d файлов и %d записей media",
                 deleted_files, deleted_records,
             )
+
+            # ============================================================
+            # 5. Убираем видеофайл с диска (запись в БД оставляем)
+            # ============================================================
+            try:
+                video_file = Path(video_path)
+                if video_file.exists():
+                    size_mb = video_file.stat().st_size / 1e6
+                    video_file.unlink()
+                    logger.info(
+                        "VK digest: видеофайл удалён с диска (%s, %.1f MB)",
+                        video_file.name, size_mb,
+                    )
+                else:
+                    logger.warning(
+                        "VK digest: видеофайл не найден для удаления: %s",
+                        video_path,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "VK digest: не удалось удалить видеофайл %s: %s",
+                    video_path, e,
+                )
 
         finally:
             vk.close()

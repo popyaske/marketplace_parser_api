@@ -115,6 +115,12 @@ services:
       VK_HASHTAGS_SOURCE: ${VK_HASHTAGS_SOURCE}
       VK_TRENDING_PAGES: ${VK_TRENDING_PAGES}
       VK_TRENDING_REFRESH_SEC: ${VK_TRENDING_REFRESH_SEC}
+        
+      # === VK Stories ===
+      VK_PUBLISH_STORY: ${VK_PUBLISH_STORY:-0}
+      VK_STORY_GROUP_ID: ${VK_STORY_GROUP_ID:-0}
+      VK_STORY_LINK_TEXT: ${VK_STORY_LINK_TEXT:-more}
+      VK_STORY_LINK_URL: ${VK_STORY_LINK_URL:-}
 
     depends_on:
       rabbitmq:
