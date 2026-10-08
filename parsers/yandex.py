@@ -1277,7 +1277,7 @@ class YandexParser(BaseParser):
             url=url,
             share_url=parsed.get("share_url") or None,
             marketplace=self.marketplace,
-            sku=str(parsed.get("sku_id") or parsed.get("product_id") or ""),
+            sku=str(parsed.get("product_id") or parsed.get("sku_id") or ""),
             brand=parsed.get("brand") or "",
             seller=parsed.get("seller") or "",
             rating=parsed.get("rating"),

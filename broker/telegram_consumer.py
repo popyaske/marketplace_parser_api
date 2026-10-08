@@ -228,6 +228,13 @@ async def run_telegram_consumer():
                         logger.info(f"Пропускаю (success=false): {url}")
                         continue
 
+                    # === Товар уже в БД — не публикуем повторно ===
+                    if data.get("already_exists"):
+                        logger.info(
+                            f"Пропускаю (товар уже в БД): {url}"
+                        )
+                        continue
+
                     price_rub = data.get("price_rub")
                     price_plus = data.get("price_with_plus")
                     if price_rub is None and price_plus is None:

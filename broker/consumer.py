@@ -20,6 +20,7 @@ from .connection import (
 )
 from services.marketplace import MarketplaceFactory
 from core.formatters import PriceFormatter, TextGenerator
+from db import product_exists
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,20 @@ async def process_url(url: str) -> dict:
             "error": data.error or "Не удалось получить данные",
         }
 
+        # === Проверка: товар уже есть в БД? ===
+    already_exists = False
+    if data.sku:
+        try:
+            already_exists = await product_exists(str(data.sku), key)
+        except Exception as e:
+            logger.warning("Ошибка проверки существования товара: %s", e)
+
+    if already_exists:
+        logger.info(
+            "Товар уже в БД (sku=%s, mp=%s) — не публикую, но обновляю цены",
+            data.sku, key,
+        )
+
     # Форматируем цены
     price_rub = PriceFormatter.format_price(str(data.price_rub)) if data.price_rub else None
     price_plus = PriceFormatter.format_price(str(data.price_with_plus)) if data.price_with_plus else None
@@ -252,6 +267,7 @@ async def process_url(url: str) -> dict:
         "resolved_url": url,
         "marketplace": key,
         "sku": data.sku,
+        "already_exists": already_exists,
         "title": data.title,
         "price_rub": data.price_rub,
         "price_with_plus": data.price_with_plus,

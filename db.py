@@ -6,6 +6,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
+import logging
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
@@ -16,6 +17,9 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import insert
+
+
+logger = logging.getLogger(__name__)
 
 
 DATABASE_URL = os.getenv(
@@ -34,16 +38,16 @@ class Product(Base):
     __tablename__ = "products"
 
     __table_args__ = (
-        UniqueConstraint("url", "marketplace", name="uq_url_marketplace"),
+        UniqueConstraint("sku", "marketplace", name="uq_sku_marketplace"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
     # Источник
-    url: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
     share_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     marketplace: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    sku: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    sku: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
 
     # Данные товара
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -191,13 +195,95 @@ def get_session_maker() -> async_sessionmaker:
 
 
 async def save_product(data: dict) -> int:
-    """Сохранить результат парсинга. Возвращает id."""
+    """
+    Сохранить результат парсинга. Возвращает id.
+
+    Уникальность: (sku, marketplace).
+      • Если товар с таким (sku, marketplace) уже есть — обновляем его
+        (цена, рейтинг, наличие, URL и т.д.) и возвращаем id.
+      • Если нет — вставляем новую запись.
+      • Если sku пустой — fallback на URL (чтобы не терять товары без артикула).
+    """
     session_maker = get_session_maker()
     async with session_maker() as session:
+        sku = data.get("sku")
+        marketplace = data.get("marketplace", "unknown")
+        url = data.get("url", "")
+
+        if sku:
+            sku_str = str(sku).strip()
+        else:
+            # Нет артикула — используем url как ключ (редкий случай)
+            sku_str = None
+
+        # === Находим существующий товар по (sku, marketplace) ===
+        existing_id = None
+        if sku_str:
+            row = (await session.execute(
+                select(Product.id)
+                .where(Product.sku == sku_str)
+                .where(Product.marketplace == marketplace)
+                .limit(1)
+            )).first()
+            if row is not None:
+                existing_id = row[0]
+
+        # Если артикула нет — ищем по URL (старое поведение)
+        if existing_id is None and not sku_str:
+            row = (await session.execute(
+                select(Product.id)
+                .where(Product.url == url)
+                .where(Product.marketplace == marketplace)
+                .limit(1)
+            )).first()
+            if row is not None:
+                existing_id = row[0]
+
+        # === Если нашли — обновляем ===
+        if existing_id is not None:
+            await session.execute(
+                update(Product)
+                .where(Product.id == existing_id)
+                .values(
+                    url=url,
+                    title=data.get("title"),
+                    price_rub=data.get("price_rub"),
+                    price_with_plus=data.get("price_with_plus"),
+                    price_original_rub=data.get("price_original_rub"),
+                    seller=data.get("seller"),
+                    brand=data.get("brand"),
+                    rating=data.get("rating"),
+                    rating_count=data.get("rating_count"),
+                    in_stock=data.get("in_stock"),
+                    image_url=data.get("image_url"),
+                    tier_used=data.get("tier_used"),
+                    post_text=data.get("post_text"),
+                    success=data.get("success", True),
+                    error=data.get("error"),
+                    created_at=func.now(),
+                )
+            )
+            logger.info(
+                "save_product: обновлён id=%d (sku=%s, mp=%s)",
+                existing_id, sku_str, marketplace,
+            )
+
+            history = PriceHistory(
+                product_id=existing_id,
+                price_rub=data.get("price_rub"),
+                price_original_rub=data.get("price_original_rub"),
+                price_with_plus=data.get("price_with_plus"),
+                in_stock=data.get("in_stock"),
+            )
+            session.add(history)
+            await session.commit()
+            return existing_id
+
+        # === Иначе — вставляем ===
         stmt = insert(Product).values(
-            url=data.get("url", ""),
-            marketplace=data.get("marketplace", "unknown"),
-            sku=data.get("sku"),
+            url=url,
+            marketplace=marketplace,
+            sku=sku_str,
             title=data.get("title"),
             price_rub=data.get("price_rub"),
             price_with_plus=data.get("price_with_plus"),
@@ -212,19 +298,8 @@ async def save_product(data: dict) -> int:
             post_text=data.get("post_text"),
             success=data.get("success", True),
             error=data.get("error"),
-        )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["url", "marketplace"],
-            set_={
-                "price_rub": data.get("price_rub"),
-                "price_with_plus": data.get("price_with_plus"),
-                "price_original_rub": data.get("price_original_rub"),
-                "rating": data.get("rating"),
-                "rating_count": data.get("rating_count"),
-                "in_stock": data.get("in_stock"),
-                "created_at": func.now(),
-            },
         ).returning(Product.id)
+
         result = await session.execute(stmt)
         await session.commit()
         product_id = result.scalar_one()
@@ -239,6 +314,10 @@ async def save_product(data: dict) -> int:
         session.add(history)
         await session.commit()
 
+        logger.info(
+            "save_product: создан id=%d (sku=%s, mp=%s, url=%s)",
+            product_id, sku_str, marketplace, url[:80],
+        )
         return product_id
 
 
@@ -566,3 +645,27 @@ async def cleanup_old_referral_publications(days: int = 7) -> int:
         result = await session.execute(stmt)
         await session.commit()
         return result.rowcount or 0
+
+
+async def product_exists(sku: str, marketplace: str) -> bool:
+    """
+    Проверяет, есть ли товар в products по (sku, marketplace).
+
+    Возвращает True, если товар уже в БД.
+    Используется consumer'ом, чтобы не публиковать дубли.
+    """
+    if not sku:
+        return False
+    sku_str = str(sku).strip()
+    if not sku_str:
+        return False
+
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        row = (await session.execute(
+            select(Product.id)
+            .where(Product.sku == sku_str)
+            .where(Product.marketplace == marketplace)
+            .limit(1)
+        )).first()
+        return row is not None

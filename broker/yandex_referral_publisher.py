@@ -147,14 +147,41 @@ async def _publish_one() -> None:
             logger.info("Yandex referral: новых товаров нет")
             return
 
+        # === Фильтр: товары, которые уже в products, не публикуем ===
+        from db import product_exists
+
+        fresh_new = []
+        for it in fresh:
+            pid = str(it.get("product_id") or "")
+            if not pid:
+                continue
+            if await product_exists(pid, "yandex"):
+                logger.info(
+                    "Yandex referral: товар %s уже в products — "
+                    "помечаю как опубликованный и пропускаю",
+                    pid,
+                )
+                # Помечаем, чтобы не пытаться снова в следующих циклах
+                await mark_referral_published(
+                    product_id=pid,
+                    title=it.get("title"),
+                    referral_link=None,
+                )
+                continue
+            fresh_new.append(it)
+
+        if not fresh_new:
+            logger.info("Yandex referral: все товары уже в БД, публиковать нечего")
+            return
+
+        fresh = fresh_new
         random.shuffle(fresh)
         max_attempts = min(len(fresh), 5)
-        # дальше — цикл по attempts, как было
         for attempt, candidate in enumerate(fresh[:max_attempts], 1):
             product_id = str(candidate["product_id"])
             product_url = (
-                candidate.get("url")
-                or f"https://market.yandex.ru/product/{product_id}"
+                    candidate.get("url")
+                    or f"https://market.yandex.ru/product/{product_id}"
             )
             logger.info(
                 "Yandex referral: попытка %d/%d — товар %s — %r",
