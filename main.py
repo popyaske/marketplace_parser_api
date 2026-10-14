@@ -16,6 +16,8 @@ from routers.queue import router as queue_router
 from routers.results import router as results_router
 from routers.compare import router as compare_router
 from routers.parse import factory as marketplace_factory
+from routers.messages import router as messages_router
+from routers.referral import router as referral_router
 from broker.connection import broker
 from db import create_tables
 
@@ -78,6 +80,8 @@ app.include_router(parse_router)
 app.include_router(queue_router)
 app.include_router(results_router)
 app.include_router(compare_router)
+app.include_router(messages_router)
+app.include_router(referral_router)
 
 
 limiter = Limiter(key_func=get_remote_address)

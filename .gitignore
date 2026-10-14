@@ -41,6 +41,8 @@ photo/
 earning_platforms.txt
 telegram.txt
 music/
+videos/
+photos/
 
 # Chrome профиль
 chrome-scraping/

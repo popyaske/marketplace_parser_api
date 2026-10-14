@@ -78,3 +78,61 @@ export async function enqueueUrl(url: string): Promise<void> {
   })
   if (!r.ok) throw new Error(`HTTP ${r.status}`)
 }
+
+export interface PublishedMessage {
+  id: number
+  product_id?: number
+  chat_id: string
+  message_id: number
+  message_link: string
+  source_url?: string
+  marketplace?: string
+  title?: string
+  created_at: string
+}
+
+export interface MessagesPage {
+  items: PublishedMessage[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export async function fetchMessages(
+  limit = 50,
+  offset = 0,
+  onlyOzonShort = true,
+): Promise<MessagesPage> {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  params.set('offset', String(offset))
+  params.set('only_ozon_short', String(onlyOzonShort))
+
+  const r = await fetch(`/api/v1/messages?${params}`)
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+  return r.json()
+}
+
+export async function deleteMessage(
+  id: number,
+  deleteFromTelegram = true,
+): Promise<void> {
+  const r = await fetch(
+    `/api/v1/messages/${id}?delete_from_telegram=${deleteFromTelegram}`,
+    { method: 'DELETE' },
+  )
+  if (!r.ok) throw new Error(`HTTP ${r.status}`)
+}
+
+export async function publishReferral(url: string): Promise<{ success: boolean; message: string }> {
+  const r = await fetch('/api/v1/referral/publish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  })
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: `HTTP ${r.status}` }))
+    throw new Error(err.detail || `HTTP ${r.status}`)
+  }
+  return r.json()
+}

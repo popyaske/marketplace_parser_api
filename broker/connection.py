@@ -13,6 +13,7 @@ QUEUE_INCOMING = "parser.incoming"      # входящие URL
 QUEUE_RESULTS_STORAGE = "parser.results.storage"     # ← storage
 QUEUE_RESULTS_TELEGRAM = "parser.results.telegram"   # ← telegram
 QUEUE_ERRORS = "parser.errors"          # ошибки
+QUEUE_REFERRAL_MANUAL = "parser.referral.manual"
 EXCHANGE_NAME = "parser"
 EXCHANGE_RESULTS = "parser.results.fanout"           # ← fanout exchange
 
@@ -54,8 +55,7 @@ class Broker:
                     durable=True,
                 )
 
-                # Очереди: incoming и errors (direct)
-                for queue_name in (QUEUE_INCOMING, QUEUE_ERRORS):
+                for queue_name in (QUEUE_INCOMING, QUEUE_ERRORS, QUEUE_REFERRAL_MANUAL):
                     queue = await self.channel.declare_queue(queue_name, durable=True)
                     await queue.bind(self.exchange, routing_key=queue_name)
 

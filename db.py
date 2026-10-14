@@ -10,7 +10,7 @@ import logging
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    func, select, desc, UniqueConstraint, update, delete
+    func, select, desc, UniqueConstraint, update, delete, text
 )
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
@@ -125,6 +125,7 @@ class PublishedMedia(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    marketplace: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True,)
     product_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
     title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     brand: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
@@ -166,6 +167,23 @@ class PublishedVideo(Base):
         DateTime(timezone=True), server_default=func.now(), index=True,
     )
 
+
+class PublishedMessage(Base):
+    """Сообщения, опубликованные в Telegram — со ссылкой для отслеживания."""
+    __tablename__ = "published_messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    product_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
+    chat_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_link: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    marketplace: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True,
+    )
+
 # === Engine и сессии ===
 
 _engine: Optional[AsyncEngine] = None
@@ -182,10 +200,21 @@ def init_engine() -> AsyncEngine:
 
 
 async def create_tables():
-    """Создать таблицы (если не существуют)."""
+    """Создать таблицы (если не существуют) + простые миграции."""
     engine = init_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # === Простые миграции ===
+        # published_media.marketplace (добавлено для правильного рендера VK-клипов)
+        await conn.execute(text("""
+            ALTER TABLE published_media
+            ADD COLUMN IF NOT EXISTS marketplace VARCHAR(32)
+        """))
+        await conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_published_media_marketplace
+            ON published_media (marketplace)
+        """))
 
 
 def get_session_maker() -> async_sessionmaker:
@@ -504,6 +533,7 @@ async def mark_referral_published(
 async def save_media(
     source: str,
     image_path: str,
+    marketplace: Optional[str] = None,
     title: Optional[str] = None,
     brand: Optional[str] = None,
     price_rub: Optional[float] = None,
@@ -522,6 +552,7 @@ async def save_media(
     async with session_maker() as session:
         media = PublishedMedia(
             source=source,
+            marketplace=marketplace,
             product_id=product_id,
             title=title,
             brand=brand,
@@ -669,3 +700,108 @@ async def product_exists(sku: str, marketplace: str) -> bool:
             .limit(1)
         )).first()
         return row is not None
+
+
+async def save_published_message(
+    chat_id: str,
+    message_id: int,
+    message_link: str,
+    source_url: Optional[str] = None,
+    marketplace: Optional[str] = None,
+    title: Optional[str] = None,
+    product_id: Optional[int] = None,
+) -> int:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        msg = PublishedMessage(
+            chat_id=str(chat_id),
+            message_id=message_id,
+            message_link=message_link,
+            source_url=source_url,
+            marketplace=marketplace,
+            title=title,
+            product_id=product_id,
+        )
+        session.add(msg)
+        await session.commit()
+        await session.refresh(msg)
+        return msg.id
+
+
+async def list_published_messages(
+    limit: int = 50,
+    offset: int = 0,
+    marketplace: Optional[str] = None,
+    only_ozon_short: bool = False,
+) -> tuple[List[PublishedMessage], int]:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        stmt = select(PublishedMessage)
+
+        if marketplace:
+            stmt = stmt.where(PublishedMessage.marketplace == marketplace)
+
+        if only_ozon_short:
+            stmt = stmt.where(PublishedMessage.marketplace == "ozon")
+            stmt = stmt.where(
+                PublishedMessage.source_url.like("https://ozon.ru/t/%")
+            )
+
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        total = (await session.execute(count_stmt)).scalar_one()
+
+        stmt = stmt.order_by(desc(PublishedMessage.created_at))
+        stmt = stmt.offset(offset).limit(limit)
+
+        result = await session.execute(stmt)
+        return list(result.scalars().all()), total
+
+
+async def get_published_message(msg_id: int) -> Optional[PublishedMessage]:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        return await session.get(PublishedMessage, msg_id)
+
+
+async def delete_published_message(msg_id: int) -> bool:
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        msg = await session.get(PublishedMessage, msg_id)
+        if msg is None:
+            return False
+        await session.delete(msg)
+        await session.commit()
+        return True
+
+
+async def cleanup_orphan_photos() -> int:
+    """
+    Удаляет из media/photos все файлы, на которые нет ссылок в БД.
+    Возвращает число удалённых файлов.
+    """
+    from pathlib import Path
+    from services.media_storage import PHOTOS_DIR  # или собрать путь вручную
+
+    session_maker = get_session_maker()
+    async with session_maker() as session:
+        rows = (await session.execute(
+            select(PublishedMedia.image_path)
+        )).all()
+        used = {r[0] for r in rows if r[0]}
+
+    photos_dir = Path("/app/media/photos")
+    if not photos_dir.exists():
+        return 0
+
+    removed = 0
+    for f in photos_dir.iterdir():
+        if not f.is_file():
+            continue
+        if str(f) in used:
+            continue
+        try:
+            f.unlink()
+            removed += 1
+        except Exception:
+            pass
+    return removed

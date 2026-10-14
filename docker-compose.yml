@@ -122,6 +122,12 @@ services:
       VK_STORY_LINK_TEXT: ${VK_STORY_LINK_TEXT:-more}
       VK_STORY_LINK_URL: ${VK_STORY_LINK_URL:-}
 
+      YANDEX_AUTO_REFERRAL: ${YANDEX_AUTO_REFERRAL:-1}
+
+      YANDEX_REFERRAL_MAX_PAGES: ${YANDEX_REFERRAL_MAX_PAGES:-30}
+      YANDEX_REFERRAL_EMPTY_STREAK: ${YANDEX_REFERRAL_EMPTY_STREAK:-3}
+      YANDEX_REFERRAL_TARGET_FRESH: ${YANDEX_REFERRAL_TARGET_FRESH:-10}
+
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -132,7 +138,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - media-data:/app/media
+      - ./photos:/app/media/photos
+      - ./videos:/app/media/videos
       - ./music:/app/media/music
       - ./fonts:/app/fonts
 
@@ -156,4 +163,3 @@ networks:
 volumes:
   rabbitmq-data:
   postgres-data:
-  media-data:

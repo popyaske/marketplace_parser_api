@@ -147,40 +147,36 @@ DEFAULTS = {
         "heart_right":        116,
         "heart_top":          106,
     },
-    "aliexpress": {
+        "aliexpress": {
         # Фото
-        "photo_h":            1086,
-        "round_radius":       36,
-        "photo_margin":       40,
+        "photo_h":            1101,
+        "round_radius":       14,
+        "photo_margin":       17,
 
-        # Старая цена + скидка (мелким, сверху)
-        "old_price_font":     40,
-        "discount_font":      40,
-        "old_price_gap":      15,
-        "old_row_top_pad":    25,
+        # Старая цена + скидка (сверху)
+        "old_price_font":     33,
+        "discount_font":      34,
+        "old_price_gap":      12,
+        "old_row_top_pad":    22,
 
-        # Цена (чёрная)
-        "price_font":         90,
-        "price_top_pad":      5,
-        "price_left_pad":     58,
+        # Цена (основная)
+        "price_font":         60,
+        "price_top_pad":      0,
+        "price_left_pad":     47,
 
         # Бейджи рейтинга и покупателей
-        "badge_font":         36,
-        "badge_pad_x":        12,
-        "badge_pad_y":        6,
-        "badge_radius":       8,
-        "badge_top_pad":      15,
+        "badge_font":         34,
+        "badge_pad_x":        11,
+        "badge_pad_y":        8,
+        "badge_radius":       13,
+        "badge_top_pad":      6,
         "badge_gap":          10,
 
         # Название
-        "title_font":         45,
-        "title_line_h":       1.15,
-        "title_top_pad":      15,
-        "title_left_pad":     58,
-
-        # Доставка (зелёная)
-        "delivery_font":      38,
-        "delivery_top_pad":   12,
+        "title_font":         39,
+        "title_line_h":       1.25,
+        "title_top_pad":      12,
+        "title_left_pad":     51,
 
         # Сердечко
         "heart_size":         42,
@@ -218,8 +214,6 @@ SLIDER_RANGES = {
     "badge_radius":    (0,   20,   1),
     "badge_top_pad":   (0,   100,  2),
     "badge_gap":       (0,   60,   2),
-    "delivery_font":   (20,  80,   2),
-    "delivery_top_pad":(0,   100,  2),
     # Рейтинг
     "rating_font":     (20,  100,  2),
     "rating_top_pad":  (0,   200,  5),
@@ -276,7 +270,6 @@ SLIDER_GROUPS = {
             "badge_radius", "badge_top_pad", "badge_gap",
         ]),
         ("Название", ["title_font", "title_line_h", "title_top_pad", "title_left_pad"]),
-        ("Доставка", ["delivery_font", "delivery_top_pad"]),
         ("Сердечко", ["heart_size", "heart_right", "heart_top"]),
     ],
 }
@@ -332,29 +325,55 @@ def _fmt_price(v):
 
 
 def _wrap(draw, text, font, max_w, max_lines=2):
+    """Перенос по словам + балансировка строк (выравнивание по ширине)."""
     if not text:
         return []
     words = text.split()
-    lines, current, consumed = [], "", 0
+    if not words:
+        return []
+
+    # Сначала жадный проход — узнаём, сколько строк реально нужно
+    lines, current = [], ""
     for word in words:
         cand = (current + " " + word).strip()
         if draw.textlength(cand, font=font) <= max_w:
             current = cand
-            consumed += 1
         else:
             if current:
                 lines.append(current)
-                if len(lines) >= max_lines:
-                    break
             current = word
-            consumed += 1
-    if current and len(lines) < max_lines:
+    if current:
         lines.append(current)
-    if len(lines) == max_lines and consumed < len(words):
+
+    # Уложились — вернуть как есть
+    if len(lines) <= max_lines:
+        return lines
+
+    # Не влезло — берём первые max_lines, хвост → «…»
+    lines = lines[:max_lines]
+
+    # Балансировка: выравниваем длину последних строк
+    # (перекидываем слова из более длинной строки в более короткую)
+    for i in range(len(lines) - 1, 0, -1):
+        prev, curr = lines[i - 1], lines[i]
+        # Пока предыдущая строка шире следующей + одно слово переносим
+        while True:
+            prev_words = prev.split()
+            if len(prev_words) <= 1:
+                break
+            if draw.textlength(curr + " " + prev_words[-1], font=font) > max_w:
+                break
+            curr = prev_words[-1] + " " + curr
+            prev = " ".join(prev_words[:-1])
+        lines[i - 1], lines[i] = prev, curr
+
+    # Если текст не влез целиком — добавить «…»
+    if len(words) > sum(len(l.split()) for l in lines):
         last = lines[-1]
         while draw.textlength(last + "…", font=font) > max_w and len(last) > 1:
             last = last[:-1]
         lines[-1] = last.rstrip() + "…"
+
     return lines
 
 
@@ -862,8 +881,6 @@ def render_aliexpress(src, params, aspect="3:4.5", W=None, H=None):
     title_font_px   = int(p["title_font"]     * s)
     title_top_pad   = int(p["title_top_pad"]  * s)
     left_pad        = int(p["title_left_pad"] * s)
-    delivery_font_px = int(p["delivery_font"] * s)
-    delivery_top_pad = int(p["delivery_top_pad"] * s)
     heart_size      = int(p["heart_size"]     * s)
     heart_right     = int(p["heart_right"]    * s)
     heart_top       = int(p["heart_top"]      * s)
@@ -875,7 +892,6 @@ def render_aliexpress(src, params, aspect="3:4.5", W=None, H=None):
     COLOR_RATING_TEXT    = (255, 108, 2, 255)     # оранжевый текст
     COLOR_BUYERS_BG      = (243, 246, 249, 255)   # серо-голубой
     COLOR_BUYERS_TEXT    = (24, 24, 27, 255)      # чёрный текст
-    COLOR_DELIVERY       = (0, 173, 48, 255)      # зелёный
     COLOR_HEART_RED      = (255, 71, 71, 255)     # красное сердечко
     COLOR_STAR_GOLD      = (255, 168, 0, 255)
 
@@ -926,7 +942,7 @@ def render_aliexpress(src, params, aspect="3:4.5", W=None, H=None):
     disc_pct = int(round((old - price_val) / old * 100))
     draw.text(
         (x_disc, y), f"-{disc_pct}%",
-        font=font_disc, fill=COLOR_TEXT_SECONDARY,
+        font=font_disc, fill=COLOR_TEXT_PRIMARY,
     )
 
     y += int(old_font_px * 1.25)
@@ -948,12 +964,12 @@ def render_aliexpress(src, params, aspect="3:4.5", W=None, H=None):
     # Бейдж рейтинга — оранжевый
     rating_text = "4.4"
     bbox = draw.textbbox((0, 0), rating_text, font=font_badge)
-    text_w = bbox[2] - bbox[0]
+    rating_text_w = bbox[2] - bbox[0]  # было text_w
     text_h = bbox[3] - bbox[1]
 
     star_size = int(badge_font_px * 0.9)
     star_gap = 4
-    rating_w = badge_pad_x * 2 + star_size + star_gap + text_w
+    rating_w = badge_pad_x * 2 + star_size + star_gap + rating_text_w  # было text_w
     rating_h = text_h + badge_pad_y * 2
 
     x_badge = price_left_pad
@@ -997,15 +1013,6 @@ def render_aliexpress(src, params, aspect="3:4.5", W=None, H=None):
     for line in title_lines:
         draw.text((left_pad, y), line, font=font_title, fill=COLOR_TEXT_PRIMARY)
         y += line_h
-
-    # === 5. Доставка (зелёная) ===
-    y += delivery_top_pad
-    font_delivery = _font(om.FONT_REGULAR, delivery_font_px)
-    delivery_str = "до 14 дней, от 46 ₽"
-    draw.text(
-        (left_pad, y), delivery_str,
-        font=font_delivery, fill=COLOR_DELIVERY,
-    )
 
     out = io.BytesIO()
     canvas.save(out, "JPEG", quality=90)

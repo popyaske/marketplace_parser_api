@@ -421,27 +421,50 @@ def fetch_vk_trending_hashtags_sync(
         current_page_before = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=5.0)
         logger.info("vk_trending: активная стр. перед стартом — %s", current_page_before)
 
-        if current_page_before and current_page_before > 1:
-            logger.info("vk_trending: возвращаюсь на стр.1...")
-            go_status = evaluate(_JS_GO_TO_FIRST_PAGE, timeout_s=5.0)
-            logger.info("vk_trending: переход на стр.1 → %s", go_status)
+        # Кликаем «назад», пока не окажемся на стр.1
+        # (виджет мог остаться на любой странице от прошлого прогона)
+        max_back_clicks = max(pages + 5, 10)
+        for i in range(max_back_clicks):
+            cur = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
+            if cur == 1:
+                if i > 0:
+                    logger.info(
+                        "vk_trending: вернулся на стр.1 после %d кликов", i,
+                    )
+                break
 
-            # Ждём смены активной страницы на 1
+            status = evaluate(_JS_GO_TO_FIRST_PAGE, timeout_s=5.0)
+            if status in ("already_first",):
+                logger.info("vk_trending: уже на стр.1")
+                break
+            if status in ("no_section", "no_nav", "no_first_button"):
+                logger.warning(
+                    "vk_trending: «назад» недоступен (status=%s, cur=%s), "
+                    "собираю с текущей страницы", status, cur,
+                )
+                break
+
+            # Клик был — ждём смены активной страницы
             deadline = time.monotonic() + PAGE_CHANGE_TIMEOUT
+            changed = False
             while time.monotonic() < deadline:
                 time.sleep(PAGE_CHANGE_POLL)
-                cur = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
-                if cur == 1:
-                    logger.info("vk_trending: вернулся на стр.1 ✅")
+                cur_now = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
+                if cur_now != cur and cur_now != -1:
+                    changed = True
                     break
-            else:
-                logger.warning("vk_trending: не удалось вернуться на стр.1, "
-                               "собираю что есть")
+            if not changed:
+                logger.warning(
+                    "vk_trending: страница не сменилась за %.1f сек, стоп сброс",
+                    PAGE_CHANGE_TIMEOUT,
+                )
+                break
 
-            # Даём React перерисовать список
-            time.sleep(0.7)
+        # Даём React перерисовать список
+        time.sleep(0.7)
 
-        logger.info("vk_trending: старт сбора со стр.1")
+        start_page = evaluate(_JS_GET_CURRENT_PAGE, timeout_s=3.0)
+        logger.info("vk_trending: старт сбора со стр.%s", start_page)
 
         for page_num in range(1, pages + 1):
             raw = evaluate(_JS_EXTRACT, timeout_s=10.0)

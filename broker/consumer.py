@@ -16,6 +16,7 @@ from .connection import (
     QUEUE_RESULTS_STORAGE,
     QUEUE_RESULTS_TELEGRAM,
     QUEUE_ERRORS,
+    QUEUE_REFERRAL_MANUAL,
     EXCHANGE_RESULTS,
 )
 from services.marketplace import MarketplaceFactory
@@ -33,6 +34,26 @@ _SHORT_URL_PATTERNS = (
     "aliexpress.ru/i/",
     "market.yandex.ru/redir",
 )
+
+import os as _os
+
+# Автоматически пускать Яндекс-ссылки в реферальный конвейер
+YANDEX_AUTO_REFERRAL = _os.getenv("YANDEX_AUTO_REFERRAL", "1") == "1"
+
+
+def _is_yandex_market_url(url: str) -> bool:
+    """
+    Яндекс-ссылка на карточку товара (в т.ч. короткая /cc/) — в реферальный
+    конвейер. Поиск (/search) идёт обычным путём.
+    """
+    if not YANDEX_AUTO_REFERRAL:
+        return False
+    low = url.lower()
+    if "market.yandex.ru" not in low:
+        return False
+    if "/search" in low:
+        return False
+    return True
 
 
 def _cdp_available(cdp_host: str = "127.0.0.1", cdp_port: int = 9222) -> bool:
@@ -263,8 +284,9 @@ async def process_url(url: str) -> dict:
 
     return {
         "success": True,
-        "url": url,
+        "url": original_url,
         "resolved_url": url,
+        "source_url": original_url,
         "marketplace": key,
         "sku": data.sku,
         "already_exists": already_exists,
@@ -305,6 +327,27 @@ async def handle_message(message: aio_pika.IncomingMessage):
             return
 
         meta = payload.get("meta", {})
+
+        # === Яндекс.Маркет → реферальный конвейер ===
+        if _is_yandex_market_url(url):
+            logger.info(
+                "consumer: %s → реферальный конвейер (parser.referral.manual)",
+                url,
+            )
+            try:
+                await broker.publish(
+                    QUEUE_REFERRAL_MANUAL,
+                    {"url": url, "meta": meta},
+                )
+            except Exception as e:
+                logger.exception("consumer: не удалось переложить в referral.manual")
+                await broker.publish(QUEUE_ERRORS, {
+                    "success": False,
+                    "url": url,
+                    "error": f"referral.routing: {e}",
+                })
+            return
+
         logger.info(f"Обрабатываю URL: {url}")
 
         result = await process_url(url)

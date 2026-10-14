@@ -141,3 +141,80 @@ tbody tr:hover { background: #f8f8ff; }
   white-space: pre-wrap; word-wrap: break-word;
   font-family: inherit; margin: 8px 0 0; font-size: 13px;
 }
+.tabs {
+  display: flex;
+  gap: 8px;
+}
+.tabs button {
+  padding: 8px 16px;
+  background: rgba(255,255,255,0.2);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.tabs button.active {
+  background: white;
+  color: #667eea;
+}
+
+.messages-page {
+  background: white;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+.messages-hint {
+  color: #666;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+.url-cell {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.url-cell a {
+  color: #667eea;
+  text-decoration: none;
+}
+.url-cell a:hover {
+  text-decoration: underline;
+}
+.copy-btn {
+  padding: 6px 12px;
+  background: #f0f4ff;
+  color: #4a5bd8;
+  border: 1px solid #d0d8ff;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+.copy-btn:hover {
+  background: #e0e8ff;
+}
+.copy-btn:active {
+  background: #d0d8ff;
+}
+.referral-btn {
+  padding: 10px 18px;
+  background: #fc3f1d;              /* Яндексовый красный */
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 14px;
+}
+.referral-btn:hover {
+  background: #e0351a;
+}
+.referral-btn:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}

@@ -4,7 +4,7 @@
 
 Хештеги:
   - Раз в 6 часов обновляются из vk.ru/trending (iframe vklanding).
-  - Если trending недоступен — фолбэк на .env (VK_HASHTAGS).
+  - Если trending недоступен - фолбэк на .env (VK_HASHTAGS).
 """
 import asyncio
 import logging
@@ -30,7 +30,6 @@ from services.media_storage import (
 )
 from services.video_maker import create_slideshow
 from services.vk_client import VKClient
-from services.overlay_maker import render_and_save
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +42,7 @@ VK_CHANNEL_LINK = os.getenv("VK_CHANNEL_LINK", "https://t.me/PromoMP1")
 VK_PUBLISH_STORY    = os.getenv("VK_PUBLISH_STORY", "0") == "1"     # вкл/выкл
 VK_STORY_GROUP_ID   = int(os.getenv("VK_STORY_GROUP_ID", "0") or 0) # 0 = от себя
 VK_STORY_LINK_TEXT  = os.getenv("VK_STORY_LINK_TEXT", "more")
-# Ссылка — берётся из VK_CHANNEL_LINK, либо отдельная VK_STORY_LINK_URL
+# Ссылка - берётся из VK_CHANNEL_LINK, либо отдельная VK_STORY_LINK_URL
 VK_STORY_LINK_URL   = os.getenv("VK_STORY_LINK_URL") or VK_CHANNEL_LINK
 
 # === Видео ===
@@ -71,7 +70,6 @@ VK_TRENDING_REFRESH_SEC = int(os.getenv("VK_TRENDING_REFRESH_SEC", str(6 * 3600)
 
 # === Runtime ===
 VK_HASHTAGS_RUNTIME: list[str] = []
-
 
 # ============================================================
 # Планировщик
@@ -162,26 +160,84 @@ def _pick_hashtags(n: int) -> list[str]:
     return random.sample(pool, k)
 
 
-def _build_vk_post_text() -> str:
+def _build_vk_post_text(media: list | None = None) -> str:
     """
-    Собирает текст поста для VK:
-      - N случайных хештегов (тренды VK или .env)
-      - ссылку на Telegram-канал
+    Полный текст описания для VK-видео.
+
+    Состав:
+      1. Заголовок
+      2. Интро (о чём подборка)
+      3. Топ-5 товаров из текущего клипа с ценами
+      4. CTA + ссылка на Telegram
+      5. Хештеги (трендовые из vk.ru/trending или .env-фолбэк)
     """
     hashtags = _pick_hashtags(VK_HASHTAGS_COUNT)
 
     parts: list[str] = []
-    if hashtags:
-        parts.append(" ".join(hashtags))
-    if VK_CHANNEL_LINK:
-        parts.append(VK_CHANNEL_LINK)
+    parts.append("🔥 Свежая подборка скидок и трендов!")
+    parts.append("")
+    parts.append(
+        "В этом клипе - самые интересные предложения "
+        "с Ozon, Wildberries, Яндекс.Маркета и AliExpress."
+    )
 
-    return "\n\n".join(parts)
+    # === Топ-5 товаров ===
+    if media:
+        lines: list[str] = []
+        for m in media[:5]:
+            title = (getattr(m, "title", None) or "").strip()
+            if not title:
+                continue
+            if len(title) > 60:
+                title = title[:57].rstrip() + "…"
+
+            # === Приоритет: Пэй/карта → обычная акционная → ничего ===
+            # (price_with_plus - это Pay-цена для Яндекса, card-цена для Ozon)
+            plus = getattr(m, "price_with_plus", None)
+            rub = getattr(m, "price_rub", None)
+            original = getattr(m, "price_original_rub", None)
+
+            # Скидочная цена = та, что показывается крупно на карточке
+            main_price = plus if plus else rub
+
+            if not main_price:
+                lines.append(f"• {title}")
+                continue
+
+            main_str = f"{int(main_price):,}".replace(",", " ") + " ₽"
+
+            # Если есть "было" и оно больше - дописываем зачёркнутой
+            if original and original > main_price:
+                old_str = f"{int(original):,}".replace(",", " ") + " ₽"
+                # эмодзи вместо зачёркивания: VK не поддерживает <s> в описании видео
+                lines.append(f"• {title} - {main_str}  (было {old_str})")
+            else:
+                lines.append(f"• {title} - {main_str}")
+
+        if lines:
+            parts.append("")
+            parts.append("📦 В подборке:")
+            parts.extend(lines)
+
+    parts.append("")
+    if VK_CHANNEL_LINK:
+        parts.append(
+            f"💬 Все товары и ссылки - в нашем Telegram: {VK_CHANNEL_LINK}"
+        )
+    parts.append("")
+    parts.append("❤️ Поставь лайк, если было полезно, и подпишись!")
+
+    if hashtags:
+        parts.append("")
+        parts.append(" ".join(hashtags))
+
+    return "\n".join(parts)
 
 
 def _build_vk_video_title() -> str:
-    """Заголовок видео в VK."""
-    return f"Скидки {datetime.now().strftime('%d.%m.%Y')}"
+    """Заголовок видео в VK (до 128 символов)."""
+    today = datetime.now().strftime("%d.%m.%Y")
+    return f"🔥 Скидки и тренды {today} - Ozon, WB, Яндекс, Ali"
 
 
 # ============================================================
@@ -203,7 +259,7 @@ def _pick_random_audio(directory: Path, exclude_names: set[str] | None = None) -
 async def _prepare_music() -> Optional[Path]:
     """
     Возвращает mp3 для фона видео из media/music/.
-    Если папка пуста — None (видео соберётся без звука).
+    Если папка пуста - None (видео соберётся без звука).
     """
     if MUSIC_DIR.exists():
         tracks = (
@@ -214,11 +270,48 @@ async def _prepare_music() -> Optional[Path]:
         tracks = [t for t in tracks if t.name != "current_popular.mp3"]
         if tracks:
             track = random.choice(tracks)
-            logger.info("VK digest: фон — %s", track.name)
+            logger.info("VK digest: фон - %s", track.name)
             return track
 
-    logger.warning("VK digest: media/music/ пуста — видео без звука")
+    logger.warning("VK digest: media/music/ пуста - видео без звука")
     return None
+
+
+def _fit_to_9_16(src_path: str, dst_path: str, W: int = 1080, H: int = 1920) -> bool:
+    """
+    Вписывает уже стилизованную карточку в кадр 9:16.
+    Сверху/снизу - размытая подложка из самой карточки (не белые полосы).
+    """
+    try:
+        from PIL import Image, ImageFilter
+
+        img = Image.open(src_path).convert("RGB")
+
+        # Задний план: растянуть на весь кадр + сильный blur
+        bg = img.resize((W, H), Image.LANCZOS)
+        bg = bg.filter(ImageFilter.GaussianBlur(radius=60))
+
+        # Основной кадр: вписать по ширине
+        scale = W / img.width
+        new_h = int(img.height * scale)
+        if new_h > H:
+            scale = H / img.height
+            new_w = int(img.width * scale)
+            new_h = H
+            main = img.resize((new_w, new_h), Image.LANCZOS)
+            x = (W - new_w) // 2
+            bg.paste(main, (x, 0))
+        else:
+            main = img.resize((W, new_h), Image.LANCZOS)
+            y = (H - new_h) // 2
+            bg.paste(main, (0, y))
+
+        Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+        bg.save(dst_path, "JPEG", quality=90)
+        return True
+    except Exception as e:
+        logger.warning("VK digest: не удалось вписать в 9:16: %s", e)
+        return False
 
 
 # ============================================================
@@ -233,7 +326,7 @@ async def _make_and_upload_one():
 
     if len(media) < VK_PHOTOS_PER_VIDEO:
         logger.info(
-            "VK digest: фото %d из %d — жду накопления",
+            "VK digest: фото %d из %d - жду накопления",
             len(media), VK_PHOTOS_PER_VIDEO,
         )
         return
@@ -246,35 +339,23 @@ async def _make_and_upload_one():
         await delete_media_records([m.id for m in media])
         return
 
-        # === Накладываем оформление на каждое фото ===
+    # === Вписываем уже стилизованные карточки в 9:16 ===
     styled_paths: list[str] = []
     for m in media:
         src = Path(m.image_path)
         if not src.exists():
             continue
-        dst = src.with_name(src.stem + "_styled.jpg")
-
-        # Бейдж с промокодом или расчётной скидкой
-        promo = ""
+        dst = src.with_name(src.stem + "_9x16.jpg")
 
         ok = await asyncio.to_thread(
-            render_and_save,
+            _fit_to_9_16,
             str(src),
             str(dst),
-            title=m.title or "",
-            brand=m.brand or "",
-            price_rub=m.price_rub,
-            price_with_plus=m.price_with_plus,
-            price_original_rub=m.price_original_rub,
-            rating=m.rating,
-            rating_count=m.rating_count,
-            legal_text=m.legal_text or "",
-            promo_badge=promo,
-            aspect="9:16",
         )
         if ok:
             styled_paths.append(str(dst))
         else:
+            # Не смогли - используем как есть (ffmpeg всё равно сделает из него кадр)
             styled_paths.append(str(src))
 
     if not styled_paths:
@@ -298,7 +379,7 @@ async def _make_and_upload_one():
     )
     if not ok:
         logger.error("VK digest: не удалось создать видео, чищу styled и выхожу")
-        # Видео не собралось — стилизованные копии не нужны
+        # Видео не собралось - стилизованные копии не нужны
         for p in styled_paths:
             if p.endswith("_styled.jpg"):
                 try:
@@ -316,9 +397,9 @@ async def _make_and_upload_one():
     )
 
     # === Публикация в VK ===
-    post_text = _build_vk_post_text()
+    post_text = _build_vk_post_text(media)
     video_title = _build_vk_video_title()
-    logger.info("VK digest: текст поста — %r", post_text[:200])
+    logger.info("VK digest: текст поста - %r", post_text[:200])
 
     try:
         vk = VKClient(VK_ACCESS_TOKEN, VK_USER_ID)
@@ -345,76 +426,29 @@ async def _make_and_upload_one():
             )
 
             # ============================================================
-            # 2. Публикуем Историю (если включено)
-            #    В историю идёт ПЕРВЫЙ стилизованный кадр — он 9:16.
+            # 3. Убираем ВСЁ, что было сгенерировано в этом цикле:
+            #    оригиналы (image_path) + промежуточные _9x16.jpg
             # ============================================================
-            if VK_PUBLISH_STORY and styled_paths:
+            removed = 0
+            for p in set(styled_paths + [m.image_path for m in media]):
+                if not p:
+                    continue
                 try:
-                    story_img = styled_paths[0]
-                    if Path(story_img).exists():
-                        story = await asyncio.to_thread(
-                            vk.upload_story,
-                            story_img,
-                            add_to_news=True,
-                            group_id=VK_STORY_GROUP_ID,
-                            link_url=VK_STORY_LINK_URL,
-                            link_text=VK_STORY_LINK_TEXT,
-                        )
-                        logger.info(
-                            "VK digest: история опубликована "
-                            "(id=%s, owner_id=%s, url=%s)",
-                            story.get("id"),
-                            story.get("owner_id"),
-                            VK_STORY_LINK_URL,
-                        )
-                    else:
-                        logger.warning(
-                            "VK digest: файл для истории не найден: %s",
-                            story_img,
-                        )
+                    fp = Path(p)
+                    if fp.exists() and fp.is_file():
+                        fp.unlink()
+                        removed += 1
                 except Exception as e:
-                    # Не валим основной поток, если история не удалась
-                    logger.warning(
-                        "VK digest: история не опубликована: %s", e
-                    )
-            else:
-                logger.info(
-                    "VK digest: история пропущена (VK_PUBLISH_STORY=%s)",
-                    VK_PUBLISH_STORY,
-                )
+                    logger.warning("VK digest: не удалить %s: %s", p, e)
 
-            # ============================================================
-            # 3. Убираем styled-копии — они больше не нужны
-            # ============================================================
-            removed_styled = 0
-            for p in styled_paths:
-                if p.endswith("_styled.jpg"):
-                    try:
-                        Path(p).unlink()
-                        removed_styled += 1
-                    except Exception:
-                        pass
-            if removed_styled:
-                logger.info(
-                    "VK digest: удалено %d styled-копий",
-                    removed_styled,
-                )
-
-            # ============================================================
-            # 4. Убираем исходные фото
-            # ============================================================
-            deleted_files = 0
-            for m in media:
-                if delete_photo(m.image_path):
-                    deleted_files += 1
             deleted_records = await delete_media_records([m.id for m in media])
             logger.info(
-                "VK digest: удалено %d файлов и %d записей media",
-                deleted_files, deleted_records,
+                "VK digest: удалено %d файлов из photos/ и %d записей media",
+                removed, deleted_records,
             )
 
             # ============================================================
-            # 5. Убираем видеофайл с диска (запись в БД оставляем)
+            # 4. Убираем видеофайл с диска (запись в БД оставляем)
             # ============================================================
             try:
                 video_file = Path(video_path)
@@ -441,5 +475,15 @@ async def _make_and_upload_one():
     except Exception as e:
         logger.exception("VK digest: ошибка публикации: %s", e)
         await update_published_video(video.id, status="failed", error=str(e)[:500])
-        # Фото НЕ удаляем — уйдут в следующий цикл
+        # Убираем промежуточные _9x16.jpg
+        for p in styled_paths:
+            if not p or "_9x16." not in p:
+                continue
+            try:
+                fp = Path(p)
+                if fp.exists() and fp.is_file():
+                    fp.unlink()
+            except Exception:
+                pass
+        # Фото НЕ удаляем - уйдут в следующий цикл
         return

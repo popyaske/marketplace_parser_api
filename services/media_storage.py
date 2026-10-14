@@ -47,13 +47,15 @@ def save_photo(data: bytes, url: str, source: str) -> Optional[str]:
 
 
 def delete_photo(path: str) -> bool:
-    """Удаляет файл фото с диска. Возвращает True, если файл удалён или не существовал."""
+    """Удаляет файл по указанному пути. Возвращает True при успехе."""
+    if not path:
+        return False
     try:
         p = Path(path)
-        if p.exists():
+        if p.exists() and p.is_file():
             p.unlink()
-            logger.info("media: файл удалён %s", p.name)
-        return True
+            logger.info("media: удалён файл %s", p.name)
+            return True
     except Exception as e:
-        logger.warning("media: не удалось удалить %s: %s", path, e)
-        return False
+        logger.warning("media: не удалить %s: %s", path, e)
+    return False

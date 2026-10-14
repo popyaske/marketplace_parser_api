@@ -24,9 +24,10 @@ from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile
 
 from .connection import broker, QUEUE_RESULTS_TELEGRAM
+from core.telegram_links import build_message_link
 from services.media_storage import save_photo
 from services.overlay_maker import render_product_card
-from db import save_media
+from db import save_media, save_published_message
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 CARD_ASPECT = os.getenv("TELEGRAM_CARD_ASPECT", "3:4.5")
 
 # Маркетплейсы, для которых рендер НЕ делаем
-NO_RENDER_MARKETPLACES = {"ozon"}
+NO_RENDER_MARKETPLACES: set[str] = set()
 
 # Юр. тексты
 LEGAL_TEXT = {
@@ -97,39 +98,14 @@ async def _send_to_telegram(data: dict) -> None:
         if image_url:
             img = await _download_image(image_url)
             if img:
-                # === 1. Сохраняем ОРИГИНАЛ для VK-клипа ===
-                try:
-                    local_path = save_photo(
-                        img, image_url, source="telegram_consumer"
-                    )
-                    if local_path:
-                        await save_media(
-                            source="telegram_consumer",
-                            image_path=local_path,
-                            title=data.get("title"),
-                            brand=data.get("brand")
-                                  or data.get("seller") or "",
-                            price_rub=data.get("price_rub"),
-                            price_with_plus=data.get("price_with_plus"),
-                            price_original_rub=data.get("price_original_rub"),
-                            rating=data.get("rating"),
-                            rating_count=data.get("rating_count"),
-                            legal_text=LEGAL_TEXT.get(marketplace, ""),
-                            post_text=post_text,
-                            image_url=image_url,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "telegram_consumer: не удалось сохранить оригинал: %s", e
-                    )
-
-                # === 2. Рендерим карточку — только если НЕ в NO_RENDER ===
+                # === 1. Сначала рендерим карточку ===
                 if marketplace not in NO_RENDER_MARKETPLACES:
                     try:
                         styled = render_product_card(
                             img,
+                            marketplace=marketplace,
                             title=data.get("title") or "",
-                            brand=data.get("brand") or "",
+                            brand=data.get("brand") or data.get("seller") or "",
                             price_rub=data.get("price_rub"),
                             price_with_plus=data.get("price_with_plus"),
                             price_original_rub=data.get("price_original_rub"),
@@ -149,15 +125,36 @@ async def _send_to_telegram(data: dict) -> None:
                         logger.warning(
                             "telegram_consumer: рендер карточки упал: %s", e
                         )
-                else:
-                    logger.info(
-                        "telegram_consumer: %s — шлю оригинал без рендера",
-                        marketplace,
+
+                # === 2. Сохраняем УЖЕ ОТРЕНДЕРЕННУЮ карточку ===
+                try:
+                    local_path = save_photo(
+                        img, image_url, source="telegram_consumer"
+                    )
+                    if local_path:
+                        await save_media(
+                            source="telegram_consumer",
+                            image_path=local_path,
+                            marketplace=marketplace,
+                            title=data.get("title"),
+                            brand=data.get("brand") or data.get("seller") or "",
+                            price_rub=data.get("price_rub"),
+                            price_with_plus=data.get("price_with_plus"),
+                            price_original_rub=data.get("price_original_rub"),
+                            rating=data.get("rating"),
+                            rating_count=data.get("rating_count"),
+                            legal_text=LEGAL_TEXT.get(marketplace, ""),
+                            post_text=post_text,
+                            image_url=image_url,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "telegram_consumer: не удалось сохранить карточку: %s", e
                     )
 
                 # === 3. Отправляем в Telegram ===
                 try:
-                    await bot.send_photo(
+                    sent = await bot.send_photo(
                         chat_id=TELEGRAM_GROUP_ID,
                         photo=BufferedInputFile(img, filename="product.jpg"),
                         caption=post_text[:1024],
@@ -166,6 +163,26 @@ async def _send_to_telegram(data: dict) -> None:
                     logger.info(
                         "telegram_consumer: пост с фото отправлен — %s", url
                     )
+
+                    # === Сохраняем ссылку на сообщение ===
+                    try:
+                        link = build_message_link(
+                            chat_id=sent.chat.id,
+                            message_id=sent.message_id,
+                            chat_username=getattr(sent.chat, "username", None),
+                        )
+                        await save_published_message(
+                            chat_id=str(sent.chat.id),
+                            message_id=sent.message_id,
+                            message_link=link,
+                            source_url=data.get("url"),
+                            marketplace=marketplace,
+                            title=data.get("title"),
+                        )
+                        logger.info("telegram_consumer: ссылка сохранена — %s", link)
+                    except Exception as e:
+                        logger.warning("telegram_consumer: не удалось сохранить ссылку: %s", e)
+
                     return
                 except Exception as e:
                     logger.warning(
@@ -174,13 +191,32 @@ async def _send_to_telegram(data: dict) -> None:
                     )
 
         # Fallback — только текст
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=TELEGRAM_GROUP_ID,
             text=post_text,
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
         )
         logger.info("telegram_consumer: пост (без фото) отправлен — %s", url)
+
+        # === Сохраняем ссылку на сообщение ===
+        try:
+            link = build_message_link(
+                chat_id=sent.chat.id,
+                message_id=sent.message_id,
+                chat_username=getattr(sent.chat, "username", None),
+            )
+            await save_published_message(
+                chat_id=str(sent.chat.id),
+                message_id=sent.message_id,
+                message_link=link,
+                source_url=data.get("url"),
+                marketplace=marketplace,
+                title=data.get("title"),
+            )
+            logger.info("telegram_consumer: ссылка сохранена — %s", link)
+        except Exception as e:
+            logger.warning("telegram_consumer: не удалось сохранить ссылку: %s", e)
 
     finally:
         try:

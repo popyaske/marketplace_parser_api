@@ -46,6 +46,9 @@ Thumbs.db
 *.json
 !requirements.txt
 !requirements-test.txt
+photos/
+videos/
+music/
 
 # Docker
 Dockerfile*

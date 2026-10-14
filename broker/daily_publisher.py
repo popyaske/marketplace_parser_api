@@ -293,6 +293,7 @@ async def _send_to_telegram(item: dict) -> None:
                         await save_media(
                             source="daily_publisher",
                             image_path=local_path,
+                            marketplace=_normalize_marketplace(item.get("marketplace_title")),
                             title=item.get("title"),
                             brand=item.get("store_title") or "",
                             price_rub=_to_float(item.get("price")),
