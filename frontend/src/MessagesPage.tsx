@@ -37,13 +37,12 @@ function MessagesPage() {
       await navigator.clipboard.writeText(m.message_link)
       setCopiedId(m.id)
       setTimeout(() => {
-        setCopiedId((cur) => (cur === m.id ? null : cur))
+      setCopiedId((cur) => (cur === m.id ? null : cur))
       }, 1500)
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e)
-        setError(msg)
-      }
-
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
+    }
   }
 
   const handleDelete = async (id: number) => {

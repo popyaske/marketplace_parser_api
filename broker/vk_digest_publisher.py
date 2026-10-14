@@ -296,12 +296,6 @@ async def _make_and_upload_one():
 
     logger.info("VK digest: взято %d фото", len(media))
 
-    photo_paths = [m.image_path for m in media if Path(m.image_path).exists()]
-    if not photo_paths:
-        logger.warning("VK digest: файлов на диске нет, чищу записи")
-        await delete_media_records([m.id for m in media])
-        return
-
     # === Вписываем уже стилизованные карточки в 9:16 ===
     styled_paths = [m.image_path for m in media if Path(m.image_path).exists()]
     if not styled_paths:
@@ -362,7 +356,7 @@ async def _make_and_upload_one():
             )
             logger.info(
                 "VK digest: видео опубликовано (owner_id=%s, video_id=%s, %d фото, %.1f сек)",
-                owner_id, vk_video_id, len(photo_paths), duration,
+                owner_id, vk_video_id, len(styled_paths), duration,
             )
 
             # ============================================================
@@ -370,7 +364,7 @@ async def _make_and_upload_one():
             #    оригиналы (image_path) + промежуточные _9x16.jpg
             # ============================================================
             removed = 0
-            for p in set(styled_paths + [m.image_path for m in media]):
+            for p in set(styled_paths):
                 if not p:
                     continue
                 try:

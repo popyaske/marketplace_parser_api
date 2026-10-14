@@ -10,7 +10,7 @@ import logging
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    func, select, desc, UniqueConstraint, update, delete, text
+    func, select, desc, UniqueConstraint, update, delete
 )
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
