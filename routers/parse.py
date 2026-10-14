@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional
 
+from core.formatters import TextGenerator
 from services.marketplace import MarketplaceFactory
 
 logger = logging.getLogger(__name__)
@@ -37,32 +38,6 @@ class ProductResponse(BaseModel):
     error: Optional[str] = None
 
 
-def _format_price(v: Optional[float]) -> str:
-    if v is None:
-        return "Не найдено"
-    if v >= 1000:
-        return f"{int(v):,}".replace(",", " ") + "₽"
-    return f"{v:.0f}₽"
-
-
-def _generate_post(data) -> str:
-    # Основная цена — обычная, если есть; иначе подписочная с пометкой
-    if data.price_rub is not None:
-        new_price_str = _format_price(data.price_rub)
-    elif data.price_with_plus is not None:
-        new_price_str = f"{_format_price(data.price_with_plus)} (с подпиской Яндекс Плюс)"
-    else:
-        new_price_str = "Не найдено"
-
-    return (
-        f"🔥 **{data.title}**\n\n"
-        f"Старая цена — {_format_price(data.price_original_rub)}\n"
-        f"Новая цена — {new_price_str}\n\n"
-        f"🙈 {data.url}\n\n"
-        f"🤫 [Чат](https://t.me/+uVvV1JcRjF03YjIy)"
-    )
-
-
 @router.get("/health")
 async def health():
     return {"status": "ok"}
@@ -89,7 +64,7 @@ async def parse_product(req: ParseRequest):
             error=data.error or "Не удалось получить данные",
         )
 
-    post_text = _generate_post(data) if req.generate_post else None
+    post_text = TextGenerator.generate(data) if req.generate_post else None
 
     return ProductResponse(
         success=True,

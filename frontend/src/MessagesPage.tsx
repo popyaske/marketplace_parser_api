@@ -8,17 +8,20 @@ function MessagesPage() {
   const [error, setError] = useState<string | null>(null)
   const [offset, setOffset] = useState(0)
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  const [marketplace, setMarketplace] = useState<string>('')
+  const [onlyOzonShort, setOnlyOzonShort] = useState(false)
   const limit = 50
 
   const load = async () => {
     setLoading(true)
     setError(null)
     try {
-      const page = await fetchMessages(limit, offset, true)
+      const page = await fetchMessages(limit, offset, onlyOzonShort, marketplace || undefined)
       setItems(page.items)
       setTotal(page.total)
-    } catch (e: any) {
-      setError(e.message || 'Ошибка загрузки')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
     } finally {
       setLoading(false)
     }
@@ -27,7 +30,7 @@ function MessagesPage() {
   useEffect(() => {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offset])
+  }, [offset, marketplace, onlyOzonShort])
 
   const handleCopy = async (m: PublishedMessage) => {
     try {
@@ -36,9 +39,11 @@ function MessagesPage() {
       setTimeout(() => {
         setCopiedId((cur) => (cur === m.id ? null : cur))
       }, 1500)
-    } catch (e: any) {
-      alert(`Не удалось скопировать: ${e.message}`)
-    }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e)
+        setError(msg)
+      }
+
   }
 
   const handleDelete = async (id: number) => {
@@ -46,8 +51,9 @@ function MessagesPage() {
     try {
       await deleteMessage(id, false)
       await load()
-    } catch (e: any) {
-      alert(`Ошибка удаления: ${e.message}`)
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
     }
   }
 
@@ -59,6 +65,27 @@ function MessagesPage() {
       <h2>📨 Опубликованные сообщения (Ozon, короткие ссылки)</h2>
       <div className="messages-hint">
         Всего: {total}. Кнопка «Копировать» кладёт ссылку в буфер обмена.
+      </div>
+
+      <div className="messages-filters">
+        <select
+          value={marketplace}
+          onChange={(e) => { setMarketplace(e.target.value); setOffset(0) }}
+        >
+          <option value="">Все маркетплейсы</option>
+          <option value="ozon">Ozon</option>
+          <option value="wildberries">Wildberries</option>
+          <option value="yandex">Яндекс</option>
+          <option value="aliexpress">AliExpress</option>
+        </select>
+        <label>
+          <input
+            type="checkbox"
+            checked={onlyOzonShort}
+            onChange={(e) => { setOnlyOzonShort(e.target.checked); setOffset(0) }}
+          />
+          Только Ozon с короткой ссылкой (/t/...)
+        </label>
       </div>
 
       {error && <div className="error">{error}</div>}

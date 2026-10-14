@@ -12,7 +12,7 @@ import os
 import random
 import time
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 import httpx as _httpx
 
 import httpx
@@ -42,6 +42,8 @@ from parsers.yandex import (
 )
 from services.media_storage import save_photo
 from services.overlay_maker import render_product_card
+from worker_health import update_last_message
+
 
 logger = logging.getLogger(__name__)
 
@@ -64,22 +66,11 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 _cdp_lock = asyncio.Lock()
 
 def _resolve_yandex_cc(url: str, timeout: float = 10.0) -> str:
-    """
-    Разворачивает /cc/XXXX → https://market.yandex.ru/card/.../<sku>?...
-
-    Не следуем редиректам — только читаем Location первого 302.
-    Это критично: Яндекс на втором шаге редиректит на /showcaptcha,
-    и если следовать — окажемся на капче вместо карточки.
-    """
     if "/cc/" not in url.lower():
         return url
 
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 ... Chrome/131.0.0.0 Safari/537.36",
         "Accept-Language": "ru-RU,ru;q=0.9",
     }
 
@@ -88,17 +79,11 @@ def _resolve_yandex_cc(url: str, timeout: float = 10.0) -> str:
             return None
         if loc.startswith("/"):
             loc = "https://market.yandex.ru" + loc
-        if "/card/" in loc or "/product" in loc:
-            return loc
-        return None
+        return loc if ("/card/" in loc or "/product" in loc) else None
 
-    # 1. Прямой запрос — не следуем редиректам
+    # шаг 1: прямой запрос без следования редиректу
     try:
-        r = _httpx.get(
-            url, timeout=timeout,
-            follow_redirects=False,
-            headers=headers,
-        )
+        r = _httpx.get(url, timeout=timeout, follow_redirects=False, headers=headers)
         loc = _clean(r.headers.get("location", ""))
         if loc:
             logger.info("referral: /cc/ развёрнут (1 шаг) — %s", loc[:120])
@@ -106,40 +91,44 @@ def _resolve_yandex_cc(url: str, timeout: float = 10.0) -> str:
     except Exception as e:
         logger.warning("referral: httpx не развернул /cc/: %s", e)
 
-    # 2. Фолбэк — на случай, если сразу отдали капчу с retpath
+    # шаг 2: retpath из showcaptcha
     try:
-        r = _httpx.get(
-            url, timeout=timeout,
-            follow_redirects=False,
-            headers=headers,
-        )
-        loc = r.headers.get("location", "") or str(r.url)
+        r = _httpx.get(url, timeout=timeout, follow_redirects=False, headers=headers)
+        loc = r.headers.get("location", "")
         if "showcaptcha" in loc:
-            from urllib.parse import urlparse, parse_qs
-            from urllib.parse import unquote
             qs = parse_qs(urlparse(loc).query)
             retpath = (qs.get("retpath") or [None])[0]
             if retpath:
-                # Yandex добавляет `,,<sig>` — берём только до запятой
-                clean = unquote(retpath).split(",")[0]
-                pad = "=" * (-len(clean) % 4)
-                import base64
-                for decoder in (base64.urlsafe_b64decode, base64.b64decode):
-                    try:
-                        decoded = decoder(clean + pad).decode("utf-8", "ignore")
-                        if "/card/" in decoded or "/product" in decoded:
-                            logger.info(
-                                "referral: /cc/ развёрнут (retpath) — %s",
-                                decoded[:120],
-                            )
-                            return decoded
-                    except Exception:
-                        continue
+                decoded = _decode_retpath(retpath)
+                if decoded:
+                    logger.info("referral: /cc/ развёрнут (retpath) — %s", decoded[:120])
+                    return decoded
     except Exception as e:
-        logger.warning("referral: retpath-фолбэк не сработал: %s", e)
+        logger.warning("referral: retpath-фолбэк упал: %s", e)
 
-    logger.warning("referral: не удалось развернуть %s", url)
+    logger.error(
+        "referral: НЕ удалось развернуть /cc/ — формат ответа изменился? url=%s",
+        url,
+    )
     return url
+
+
+def _decode_retpath(retpath: str) -> Optional[str]:
+    """Yandex отдаёт retpath как URL-encoded base64, иногда с `,,<sig>`."""
+    import base64
+    from urllib.parse import unquote
+
+    clean = unquote(retpath).split(",")[0]
+    pad = "=" * (-len(clean) % 4)
+    for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            decoded = decoder(clean + pad).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if "/card/" in decoded or "/product" in decoded:
+            return decoded
+    logger.warning("referral: не удалось декодировать retpath=%s", retpath[:80])
+    return None
 
 
 def _build_referral_url(page: int) -> str:
@@ -718,16 +707,15 @@ def _build_post_text(item: dict, referral_link: str) -> str:
 
     product = ProductData(
         title=item.get("title") or "Товар Яндекс.Маркета",
-        price_rub=primary,
-        price_with_plus=None,
-        price_original_rub=old_for_post,
+        price_rub=regular,
+        price_with_plus=pay if (pay and regular and pay < regular) else None,
+        price_original_rub=old if (old and regular and old > regular) else None,
         url=referral_link,
         marketplace="yandex",
         sku=str(item.get("product_id") or ""),
         image_url=item.get("image"),
         success=True,
         tier_used="yandex_referral",
-        # === Промокод — передаём, чтобы TextGenerator вставил строку ===
         promo_code=item.get("promo_code"),
         promo_percent=item.get("promo_percent"),
     )
@@ -845,6 +833,7 @@ async def run_referral_manual_consumer():
         async for message in it:
             async with message.process():
                 try:
+                    update_last_message()
                     payload = _json.loads(message.body.decode())
                 except Exception as e:
                     logger.error("referral manual: invalid JSON: %s", e)

@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import {
   fetchResults, fetchStats, deleteResult, enqueueUrl, publishReferral,
-  Product, Stats, Filters,
+  Product, Stats, Filters
 } from './api'
 import MessagesPage from './MessagesPage'
 
@@ -30,6 +30,7 @@ function App() {
     page: 1,
     per_page: 20,
   })
+  const [debouncedSearch, setDebouncedSearch] = useState(filters.search || '')
 
   const [total, setTotal] = useState(0)
   const [pages, setPages] = useState(0)
@@ -46,38 +47,85 @@ function App() {
     setError(null)
     try {
       const [page, s] = await Promise.all([
-        fetchResults(filters),
+        fetchResults({ ...filters, search: debouncedSearch }),
         fetchStats(),
       ])
       setResults(page.items)
       setTotal(page.total)
       setPages(page.pages)
       setStats(s)
-    } catch (e: any) {
-      setError(e.message || 'Ошибка загрузки')
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
     } finally {
       setLoading(false)
     }
   }
 
+  // debounce для строки поиска — 400мс
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(filters.search || ''), 400)
+    return () => clearTimeout(t)
+  }, [filters.search])
+
+  // loadData срабатывает по «стабильным» фильтрам
   useEffect(() => {
     if (tab === 'dashboard') loadData()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filters, tab])
+  }, [
+    tab,
+    filters.marketplace,
+    filters.min_price,
+    filters.max_price,
+    filters.page,
+    filters.per_page,
+    debouncedSearch,
+  ])
 
-  // SSE автообновление (только для вкладки Товары)
+  // --- SSE с backoff и AbortController ---
   useEffect(() => {
     if (tab !== 'dashboard') return
-    const es = new EventSource('/api/v1/results/stream')
-    es.addEventListener('product', (e: MessageEvent) => {
-      try {
-        const product = JSON.parse(e.data)
-        setResults((prev) => [product, ...prev])
-        setTotal((t) => t + 1)
-      } catch {}
-    })
-    return () => es.close()
+    const ctrl = new AbortController()
+    let es: EventSource | null = null
+    let retryDelay = 1000
+
+    const connect = () => {
+      if (ctrl.signal.aborted) return
+      es = new EventSource('/api/v1/results/stream')
+
+      es.onopen = () => { retryDelay = 1000 }
+      es.addEventListener('product', (e: MessageEvent) => {
+        try {
+          const product = JSON.parse(e.data)
+          setResults((prev) => [product, ...prev])
+          setTotal((t) => t + 1)
+        } catch {}
+      })
+      es.onerror = () => {
+        es?.close()
+        es = null
+        if (ctrl.signal.aborted) return
+        const delay = Math.min(retryDelay, 30000)
+        retryDelay = Math.min(retryDelay * 2, 30000)
+        setTimeout(connect, delay)
+      }
+    }
+    connect()
+
+    return () => {
+      ctrl.abort()
+      es?.close()
+    }
   }, [tab])
+
+  // --- setTimeout с очисткой ---
+  const enqueueTimerRef = useRef<number | null>(null)
+
+  useEffect(() => () => {
+    if (enqueueTimerRef.current !== null) {
+      clearTimeout(enqueueTimerRef.current)
+    }
+  }, [])
 
   const handleEnqueue = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -87,12 +135,14 @@ function App() {
       await enqueueUrl(newUrl.trim())
       setEnqueueStatus('✅ URL добавлен в очередь. Обновите через 10 секунд.')
       setNewUrl('')
-      setTimeout(() => {
+      enqueueTimerRef.current = window.setTimeout(() => {
         setEnqueueStatus(null)
         loadData()
+        enqueueTimerRef.current = null
       }, 10000)
-    } catch (e: any) {
-      setEnqueueStatus(`❌ Ошибка: ${e.message}`)
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
     }
   }
 
@@ -101,8 +151,9 @@ function App() {
     try {
       await deleteResult(id)
       loadData()
-    } catch (e: any) {
-      alert(`Ошибка удаления: ${e.message}`)
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(msg)
     }
   }
 
@@ -326,8 +377,9 @@ function App() {
                             try {
                               const res = await publishReferral(selected.url)
                               alert(`✅ ${res.message}\n\nПост появится в Telegram через ~30 секунд.`)
-                            } catch (e: any) {
-                              alert(`❌ Ошибка: ${e.message}`)
+                            } catch (e: unknown) {
+                              const msg = e instanceof Error ? e.message : String(e)
+                              setError(msg)
                             }
                           }}
                         >

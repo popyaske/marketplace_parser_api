@@ -277,43 +277,6 @@ async def _prepare_music() -> Optional[Path]:
     return None
 
 
-def _fit_to_9_16(src_path: str, dst_path: str, W: int = 1080, H: int = 1920) -> bool:
-    """
-    Вписывает уже стилизованную карточку в кадр 9:16.
-    Сверху/снизу - размытая подложка из самой карточки (не белые полосы).
-    """
-    try:
-        from PIL import Image, ImageFilter
-
-        img = Image.open(src_path).convert("RGB")
-
-        # Задний план: растянуть на весь кадр + сильный blur
-        bg = img.resize((W, H), Image.LANCZOS)
-        bg = bg.filter(ImageFilter.GaussianBlur(radius=60))
-
-        # Основной кадр: вписать по ширине
-        scale = W / img.width
-        new_h = int(img.height * scale)
-        if new_h > H:
-            scale = H / img.height
-            new_w = int(img.width * scale)
-            new_h = H
-            main = img.resize((new_w, new_h), Image.LANCZOS)
-            x = (W - new_w) // 2
-            bg.paste(main, (x, 0))
-        else:
-            main = img.resize((W, new_h), Image.LANCZOS)
-            y = (H - new_h) // 2
-            bg.paste(main, (0, y))
-
-        Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-        bg.save(dst_path, "JPEG", quality=90)
-        return True
-    except Exception as e:
-        logger.warning("VK digest: не удалось вписать в 9:16: %s", e)
-        return False
-
-
 # ============================================================
 # Одна публикация
 # ============================================================
@@ -340,26 +303,10 @@ async def _make_and_upload_one():
         return
 
     # === Вписываем уже стилизованные карточки в 9:16 ===
-    styled_paths: list[str] = []
-    for m in media:
-        src = Path(m.image_path)
-        if not src.exists():
-            continue
-        dst = src.with_name(src.stem + "_9x16.jpg")
-
-        ok = await asyncio.to_thread(
-            _fit_to_9_16,
-            str(src),
-            str(dst),
-        )
-        if ok:
-            styled_paths.append(str(dst))
-        else:
-            # Не смогли - используем как есть (ffmpeg всё равно сделает из него кадр)
-            styled_paths.append(str(src))
-
+    styled_paths = [m.image_path for m in media if Path(m.image_path).exists()]
     if not styled_paths:
-        logger.warning("VK digest: не удалось подготовить ни одного фото")
+        logger.warning("VK digest: нет файлов на диске, чищу записи")
+        await delete_media_records([m.id for m in media])
         return
 
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -379,19 +326,12 @@ async def _make_and_upload_one():
     )
     if not ok:
         logger.error("VK digest: не удалось создать видео, чищу styled и выхожу")
-        # Видео не собралось - стилизованные копии не нужны
-        for p in styled_paths:
-            if p.endswith("_styled.jpg"):
-                try:
-                    Path(p).unlink()
-                except Exception:
-                    pass
         return
 
     # Записываем факт создания видео
     video = await create_published_video(
         file_path=str(video_path),
-        photo_count=len(photo_paths),
+        photo_count=len(styled_paths),
         duration_sec=duration,
         status="created",
     )
@@ -475,15 +415,4 @@ async def _make_and_upload_one():
     except Exception as e:
         logger.exception("VK digest: ошибка публикации: %s", e)
         await update_published_video(video.id, status="failed", error=str(e)[:500])
-        # Убираем промежуточные _9x16.jpg
-        for p in styled_paths:
-            if not p or "_9x16." not in p:
-                continue
-            try:
-                fp = Path(p)
-                if fp.exists() and fp.is_file():
-                    fp.unlink()
-            except Exception:
-                pass
-        # Фото НЕ удаляем - уйдут в следующий цикл
         return

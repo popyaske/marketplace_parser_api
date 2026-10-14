@@ -58,76 +58,10 @@ class StatsOut(BaseModel):
     last_24h: int
 
 
-@router.get("", response_model=ProductsPage)
-async def list_results(
-    marketplace: Optional[str] = Query(None, description="Фильтр по маркетплейсу"),
-    search: Optional[str] = Query(None, description="Поиск по названию"),
-    min_price: Optional[float] = Query(None, ge=0),
-    max_price: Optional[float] = Query(None, ge=0),
-    page: int = Query(1, ge=1),
-    per_page: int = Query(20, ge=1, le=100),
-):
-    """
-    Список результатов парсинга с фильтрами и пагинацией.
-    """
-    items, total = await list_products(
-        marketplace=marketplace,
-        search=search,
-        min_price=min_price,
-        max_price=max_price,
-        page=page,
-        per_page=per_page,
-    )
-    pages = (total + per_page - 1) // per_page if total > 0 else 0
-    return ProductsPage(
-        items=[ProductOut.model_validate(p) for p in items],
-        total=total,
-        page=page,
-        per_page=per_page,
-        pages=pages,
-    )
-
-
 @router.get("/stats", response_model=StatsOut)
 async def stats():
     """Статистика по результатам."""
     return StatsOut(**await get_stats())
-
-
-@router.get("/{product_id}", response_model=ProductOut)
-async def get_result(product_id: int):
-    """Один результат по id."""
-    product = await get_product(product_id)
-    if product is None:
-        raise HTTPException(status_code=404, detail="Не найдено")
-    return ProductOut.model_validate(product)
-
-
-@router.delete("/{product_id}")
-async def delete_result(product_id: int):
-    """Удалить результат."""
-    ok = await delete_product(product_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Не найдено")
-    return {"success": True}
-
-
-@router.get("/{product_id}/history")
-async def product_price_history(product_id: int, limit: int = 100):
-    """История цен для товара."""
-    history = await get_price_history(product_id, limit)
-    return {
-        "product_id": product_id,
-        "history": [
-            {
-                "price_rub": h.price_rub,
-                "price_original_rub": h.price_original_rub,
-                "in_stock": h.in_stock,
-                "created_at": h.created_at,
-            }
-            for h in history
-        ],
-    }
 
 
 @router.get("/stream")
@@ -177,3 +111,69 @@ async def export_csv():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=products.csv"},
     )
+
+
+@router.get("", response_model=ProductsPage)
+async def list_results(
+    marketplace: Optional[str] = Query(None, description="Фильтр по маркетплейсу"),
+    search: Optional[str] = Query(None, description="Поиск по названию"),
+    min_price: Optional[float] = Query(None, ge=0),
+    max_price: Optional[float] = Query(None, ge=0),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+):
+    """
+    Список результатов парсинга с фильтрами и пагинацией.
+    """
+    items, total = await list_products(
+        marketplace=marketplace,
+        search=search,
+        min_price=min_price,
+        max_price=max_price,
+        page=page,
+        per_page=per_page,
+    )
+    pages = (total + per_page - 1) // per_page if total > 0 else 0
+    return ProductsPage(
+        items=[ProductOut.model_validate(p) for p in items],
+        total=total,
+        page=page,
+        per_page=per_page,
+        pages=pages,
+    )
+
+
+@router.get("/{product_id}", response_model=ProductOut)
+async def get_result(product_id: int):
+    """Один результат по id."""
+    product = await get_product(product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Не найдено")
+    return ProductOut.model_validate(product)
+
+
+@router.delete("/{product_id}")
+async def delete_result(product_id: int):
+    """Удалить результат."""
+    ok = await delete_product(product_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Не найдено")
+    return {"success": True}
+
+
+@router.get("/{product_id}/history")
+async def product_price_history(product_id: int, limit: int = 100):
+    """История цен для товара."""
+    history = await get_price_history(product_id, limit)
+    return {
+        "product_id": product_id,
+        "history": [
+            {
+                "price_rub": h.price_rub,
+                "price_original_rub": h.price_original_rub,
+                "in_stock": h.in_stock,
+                "created_at": h.created_at,
+            }
+            for h in history
+        ],
+    }

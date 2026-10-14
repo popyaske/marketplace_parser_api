@@ -20,7 +20,7 @@ from typing import Optional
 import httpx
 
 from core.models import ProductData
-from .base import BaseParser
+from .base import BaseParser, cdp_wait_for_load
 
 logger = logging.getLogger("aliexpress")
 
@@ -124,8 +124,6 @@ class AliexpressParser(BaseParser):
                     logger.error(f"Вкладка /item/{item_id} не появилась за 20 сек")
                     return None
 
-                # Даём странице догрузиться (x5sec, DOM, цены)
-                time.sleep(3.0)
 
             ws_url = tab.get("webSocketDebuggerUrl")
             if not ws_url:
@@ -159,7 +157,8 @@ class AliexpressParser(BaseParser):
                         return data
                 return {}
 
-            send("Runtime.enable")
+            send("Page.enable")
+            cdp_wait_for_load(ws, timeout_s=10.0, url_contains=f"/item/{item_id}")
 
             # JS для чтения DOM
             js = r"""

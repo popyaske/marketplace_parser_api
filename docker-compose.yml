@@ -4,29 +4,38 @@ services:
     container_name: marketplace-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: parser
-      POSTGRES_PASSWORD: parser
-      POSTGRES_DB: parser
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Раскомментируй, если нужен доступ к БД с Windows-хоста (psql/DBeaver/pgAdmin)
+    # ports:
+    #   - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
       - parser-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U parser"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: marketplace-rabbitmq
     restart: unless-stopped
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      # 127.0.0.1 — только с этой машины. Убери префикс, если нужен доступ из локалки
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     networks:
@@ -37,18 +46,24 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   parser:
     build: .
     container_name: marketplace-parser
     restart: unless-stopped
+    command: ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"]
     ports:
       - "8000:8000"
     environment:
       CDP_HOST: 192.168.65.254
       CDP_PORT: 9222
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      DATABASE_URL: postgresql+asyncpg://parser:parser@postgres:5432/parser
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LOG_LEVEL: INFO
     depends_on:
       rabbitmq:
@@ -62,9 +77,17 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
 
   worker:
     build:
@@ -72,36 +95,45 @@ services:
       dockerfile: Dockerfile
     container_name: marketplace-worker
     restart: unless-stopped
-
     command: ["python", "worker.py"]
-
     expose:
       - "8080"
-
     healthcheck:
-      test: [ "CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health', timeout=2)" ]
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8080/health', timeout=2)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
-
     environment:
       CDP_HOST: 192.168.65.254
       CDP_PORT: 9222
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      DATABASE_URL: postgresql+asyncpg://parser:parser@postgres:5432/parser
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       LOG_LEVEL: INFO
+
+      # --- Telegram ---
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHANNEL_ID: ${TELEGRAM_CHANNEL_ID:-}
+      TELEGRAM_GROUP_ID: ${TELEGRAM_GROUP_ID:-}
       TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
+
+      # --- Такпродам ---
       TAKPRODAM_API_TOKEN: ${TAKPRODAM_API_TOKEN:-}
       TAKPRODAM_SOURCE_ID: ${TAKPRODAM_SOURCE_ID:-0}
       TAKPRODAM_MARKETPLACE: ${TAKPRODAM_MARKETPLACE:-}
       TAKPRODAM_SUBID: ${TAKPRODAM_SUBID:-tg_daily}
       PUBLISH_HOUR: ${PUBLISH_HOUR:-20}
       PUBLISH_TZ_OFFSET: ${PUBLISH_TZ_OFFSET:-3}
-      YANDEX_REFERRAL_INTERVAL: ${YANDEX_REFERRAL_INTERVAL:-600}
-      MEDIA_ROOT: /app/media
+
+      # --- Яндекс.рефералка ---
+      YANDEX_AUTO_REFERRAL: ${YANDEX_AUTO_REFERRAL:-1}
+      YANDEX_REFERRAL_INTERVAL: ${YANDEX_REFERRAL_INTERVAL:-3600}
+      YANDEX_REFERRAL_MAX_PAGES: ${YANDEX_REFERRAL_MAX_PAGES:-100}
+      YANDEX_REFERRAL_EMPTY_STREAK: ${YANDEX_REFERRAL_EMPTY_STREAK:-3}
+      YANDEX_REFERRAL_TARGET_FRESH: ${YANDEX_REFERRAL_TARGET_FRESH:-10}
+      YANDEX_REFERRAL_PUBLISH_DELAY: ${YANDEX_REFERRAL_PUBLISH_DELAY:-12.0}
+
+      # --- VK Digest ---
       VK_ACCESS_TOKEN: ${VK_ACCESS_TOKEN:-}
       VK_USER_ID: ${VK_USER_ID:-0}
       VK_DIGEST_INTERVAL: ${VK_DIGEST_INTERVAL:-86400}
@@ -109,29 +141,28 @@ services:
       VK_PHOTO_DURATION: ${VK_PHOTO_DURATION:-3.0}
       VK_VIDEO_WIDTH: ${VK_VIDEO_WIDTH:-1080}
       VK_VIDEO_HEIGHT: ${VK_VIDEO_HEIGHT:-1920}
-      VK_HASHTAGS: ${VK_HASHTAGS:-#скидки,#маркетплейсы,#промокоды}
-      VK_HASHTAGS_COUNT: ${VK_HASHTAGS_COUNT}
+      VK_HASHTAGS: ${VK_HASHTAGS:-#скидки,#маркетплейсы,#промокоды,#ozon,#wildberries}
+      VK_HASHTAGS_COUNT: ${VK_HASHTAGS_COUNT:-3}
+      VK_HASHTAGS_SOURCE: ${VK_HASHTAGS_SOURCE:-trending}
+      VK_TRENDING_PAGES: ${VK_TRENDING_PAGES:-2}
+      VK_TRENDING_REFRESH_SEC: ${VK_TRENDING_REFRESH_SEC:-21600}
       VK_CHANNEL_LINK: ${VK_CHANNEL_LINK:-https://t.me/PromoMP1}
-      VK_HASHTAGS_SOURCE: ${VK_HASHTAGS_SOURCE}
-      VK_TRENDING_PAGES: ${VK_TRENDING_PAGES}
-      VK_TRENDING_REFRESH_SEC: ${VK_TRENDING_REFRESH_SEC}
-        
-      # === VK Stories ===
+
+      # --- VK Stories (опционально) ---
       VK_PUBLISH_STORY: ${VK_PUBLISH_STORY:-0}
       VK_STORY_GROUP_ID: ${VK_STORY_GROUP_ID:-0}
       VK_STORY_LINK_TEXT: ${VK_STORY_LINK_TEXT:-more}
       VK_STORY_LINK_URL: ${VK_STORY_LINK_URL:-}
 
-      YANDEX_AUTO_REFERRAL: ${YANDEX_AUTO_REFERRAL:-1}
-
-      YANDEX_REFERRAL_MAX_PAGES: ${YANDEX_REFERRAL_MAX_PAGES:-30}
-      YANDEX_REFERRAL_EMPTY_STREAK: ${YANDEX_REFERRAL_EMPTY_STREAK:-3}
-      YANDEX_REFERRAL_TARGET_FRESH: ${YANDEX_REFERRAL_TARGET_FRESH:-10}
+      # --- Медиа ---
+      MEDIA_ROOT: /app/media
 
     depends_on:
       rabbitmq:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      parser:
         condition: service_healthy
     networks:
       - parser-network
@@ -142,6 +173,13 @@ services:
       - ./videos:/app/media/videos
       - ./music:/app/media/music
       - ./fonts:/app/fonts
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   frontend:
     build:
@@ -152,9 +190,15 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - parser
+      parser:
+        condition: service_healthy
     networks:
       - parser-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   parser-network:

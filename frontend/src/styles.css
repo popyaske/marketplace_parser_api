@@ -218,3 +218,23 @@ tbody tr:hover { background: #f8f8ff; }
   background: #ccc;
   cursor: not-allowed;
 }
+.messages-filters {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.messages-filters select {
+  padding: 8px 12px;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  font-size: 14px;
+}
+.messages-filters label {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 13px;
+  cursor: pointer;
+}

@@ -33,6 +33,8 @@ Thumbs.db
 
 # Локальные файлы
 .env
+.env.*
+!.env.example
 *.log
 *.json
 requirements.txt

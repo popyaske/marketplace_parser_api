@@ -19,9 +19,12 @@ from .connection import (
     QUEUE_REFERRAL_MANUAL,
     EXCHANGE_RESULTS,
 )
+from parsers.base import cdp_wait_for_load
 from services.marketplace import MarketplaceFactory
 from core.formatters import PriceFormatter, TextGenerator
 from db import product_exists
+from worker_health import update_last_message
+
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +38,32 @@ _SHORT_URL_PATTERNS = (
     "market.yandex.ru/redir",
 )
 
-import os as _os
-
 # Автоматически пускать Яндекс-ссылки в реферальный конвейер
-YANDEX_AUTO_REFERRAL = _os.getenv("YANDEX_AUTO_REFERRAL", "1") == "1"
+YANDEX_AUTO_REFERRAL = os.getenv("YANDEX_AUTO_REFERRAL", "1") == "1"
+
+
+def _ws_send(ws, msg_id_holder, method: str, params: dict | None = None,
+             timeout_s: float = 10.0) -> dict:
+    msg_id_holder[0] += 1
+    cur = msg_id_holder[0]
+    payload = {"id": cur, "method": method}
+    if params:
+        payload["params"] = params
+    ws.send(json.dumps(payload))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        ws.settimeout(max(0.1, deadline - time.monotonic()))
+        try:
+            raw = ws.recv()
+        except Exception:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if data.get("id") == cur:
+            return data
+    return {}
 
 
 def _is_yandex_market_url(url: str) -> bool:
@@ -118,30 +143,12 @@ def _cdp_expand_short_url(
             msg_id = [0]
 
             def send(method, params=None, timeout_s=10.0):
-                msg_id[0] += 1
-                cur = msg_id[0]
-                payload = {"id": cur, "method": method}
-                if params:
-                    payload["params"] = params
-                ws.send(json.dumps(payload))
-                deadline = time.monotonic() + timeout_s
-                while time.monotonic() < deadline:
-                    ws.settimeout(max(0.1, deadline - time.monotonic()))
-                    try:
-                        raw = ws.recv()
-                    except Exception:
-                        return {}
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("id") == cur:
-                        return data
-                return {}
+                return _ws_send(ws, msg_id, method, params, timeout_s)
 
             send("Page.enable")
             send("Page.navigate", {"url": url}, timeout_s=5.0)
-            time.sleep(3.0)
+            cdp_wait_for_load(ws, timeout_s=8.0, url_contains="ozon.ru/product")
+
             final_url = (send("Runtime.evaluate", {
                 "expression": "document.location.href",
                 "returnByValue": True,
@@ -159,28 +166,11 @@ def _cdp_expand_short_url(
             msg_id = [0]
 
             def send(method, params=None, timeout_s=10.0):
-                msg_id[0] += 1
-                cur = msg_id[0]
-                payload = {"id": cur, "method": method}
-                if params:
-                    payload["params"] = params
-                ws.send(json.dumps(payload))
-                deadline = time.monotonic() + timeout_s
-                while time.monotonic() < deadline:
-                    ws.settimeout(max(0.1, deadline - time.monotonic()))
-                    try:
-                        raw = ws.recv()
-                    except Exception:
-                        return {}
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("id") == cur:
-                        return data
-                return {}
+                return _ws_send(ws, msg_id, method, params, timeout_s)
 
             send("Runtime.enable")
+            cdp_wait_for_load(ws, timeout_s=10.0, url_contains="ozon.ru/product")
+
             for _ in range(10):
                 time.sleep(0.5)
                 final_url = (send("Runtime.evaluate", {
@@ -211,7 +201,7 @@ async def process_url(url: str) -> dict:
         dict с полями success, marketplace, title, price_rub, post_text, error
     """
     original_url = url
-    url = url = await asyncio.to_thread(
+    url = await asyncio.to_thread(
         _cdp_expand_short_url,
         original_url,
         cdp_host=os.getenv("CDP_HOST", "127.0.0.1"),
@@ -312,6 +302,7 @@ async def handle_message(message: aio_pika.IncomingMessage):
     """Обработать одно сообщение из очереди."""
     async with message.process():
         try:
+            update_last_message()
             payload = json.loads(message.body.decode())
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON: {e}")

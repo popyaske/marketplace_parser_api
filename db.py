@@ -199,24 +199,6 @@ def init_engine() -> AsyncEngine:
     return _engine
 
 
-async def create_tables():
-    """Создать таблицы (если не существуют) + простые миграции."""
-    engine = init_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-        # === Простые миграции ===
-        # published_media.marketplace (добавлено для правильного рендера VK-клипов)
-        await conn.execute(text("""
-            ALTER TABLE published_media
-            ADD COLUMN IF NOT EXISTS marketplace VARCHAR(32)
-        """))
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_published_media_marketplace
-            ON published_media (marketplace)
-        """))
-
-
 def get_session_maker() -> async_sessionmaker:
     if _session_maker is None:
         init_engine()
@@ -468,6 +450,13 @@ async def get_published_ids() -> set[str]:
         return {row[0] for row in result.all()}
 
 
+async def create_tables():
+    """Только для тестов. В prod используем Alembic (`alembic upgrade head`)."""
+    engine = init_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 async def mark_published(item: dict) -> None:
     """Отметить товар как опубликованный (идемпотентно)."""
     session_maker = get_session_maker()
@@ -664,8 +653,9 @@ async def delete_media_records(media_ids: List[int]) -> int:
         return result.rowcount or 0
 
 
-async def cleanup_old_referral_publications(days: int = 7) -> int:
-    """Удаляет старые записи о публикациях, чтобы товары снова попали в ротацию."""
+async def cleanup_old_referral_publications(days: int = 30) -> int:
+    """Удаляет старые записи о публикациях (по умолчанию 30 дней),
+    чтобы товары снова попали в ротацию."""
     session_maker = get_session_maker()
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     async with session_maker() as session:
@@ -780,7 +770,7 @@ async def cleanup_orphan_photos() -> int:
     Возвращает число удалённых файлов.
     """
     from pathlib import Path
-    from services.media_storage import PHOTOS_DIR  # или собрать путь вручную
+    from services.media_storage import PHOTOS_DIR
 
     session_maker = get_session_maker()
     async with session_maker() as session:
@@ -789,7 +779,7 @@ async def cleanup_orphan_photos() -> int:
         )).all()
         used = {r[0] for r in rows if r[0]}
 
-    photos_dir = Path("/app/media/photos")
+    photos_dir = Path(PHOTOS_DIR)
     if not photos_dir.exists():
         return 0
 

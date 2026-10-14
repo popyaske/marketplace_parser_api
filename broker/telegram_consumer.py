@@ -6,8 +6,7 @@ Telegram-consumer: публикует результаты парсинга в �
   • TELEGRAM_GROUP_ID (fallback — TELEGRAM_CHANNEL_ID)
 
 Логика:
-  • Ozon → без рендера, шлётся оригинальное фото + post_text.
-  • Яндекс / WB / AliExpress → рендер карточки через overlay_maker.
+  • ВСЕ маркетплейсы проходят через overlay_maker (render_product_card).
   • Оригинал фото всегда сохраняется в published_media (для VK-клипа).
 """
 import json
@@ -28,6 +27,8 @@ from core.telegram_links import build_message_link
 from services.media_storage import save_photo
 from services.overlay_maker import render_product_card
 from db import save_media, save_published_message
+from worker_health import update_last_message
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +41,6 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
 # Аспект карточки
 CARD_ASPECT = os.getenv("TELEGRAM_CARD_ASPECT", "3:4.5")
-
-# Маркетплейсы, для которых рендер НЕ делаем
-NO_RENDER_MARKETPLACES: set[str] = set()
 
 # Юр. тексты
 LEGAL_TEXT = {
@@ -99,32 +97,31 @@ async def _send_to_telegram(data: dict) -> None:
             img = await _download_image(image_url)
             if img:
                 # === 1. Сначала рендерим карточку ===
-                if marketplace not in NO_RENDER_MARKETPLACES:
-                    try:
-                        styled = render_product_card(
-                            img,
-                            marketplace=marketplace,
-                            title=data.get("title") or "",
-                            brand=data.get("brand") or data.get("seller") or "",
-                            price_rub=data.get("price_rub"),
-                            price_with_plus=data.get("price_with_plus"),
-                            price_original_rub=data.get("price_original_rub"),
-                            rating=data.get("rating"),
-                            rating_count=data.get("rating_count"),
-                            legal_text=LEGAL_TEXT.get(marketplace, ""),
-                            promo_badge="",
-                            aspect=CARD_ASPECT,
+                try:
+                    styled = render_product_card(
+                        img,
+                        marketplace=marketplace,
+                        title=data.get("title") or "",
+                        brand=data.get("brand") or data.get("seller") or "",
+                        price_rub=data.get("price_rub"),
+                        price_with_plus=data.get("price_with_plus"),
+                        price_original_rub=data.get("price_original_rub"),
+                        rating=data.get("rating"),
+                        rating_count=data.get("rating_count"),
+                        legal_text=LEGAL_TEXT.get(marketplace, ""),
+                        promo_badge="",
+                        aspect=CARD_ASPECT,
+                    )
+                    if styled:
+                        img = styled
+                        logger.info(
+                            "telegram_consumer: карточка отрендерена (%s)",
+                            CARD_ASPECT,
                         )
-                        if styled:
-                            img = styled
-                            logger.info(
-                                "telegram_consumer: карточка отрендерена (%s)",
-                                CARD_ASPECT,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "telegram_consumer: рендер карточки упал: %s", e
-                        )
+                except Exception as e:
+                    logger.warning(
+                        "telegram_consumer: рендер карточки упал: %s", e
+                    )
 
                 # === 2. Сохраняем УЖЕ ОТРЕНДЕРЕННУЮ карточку ===
                 try:
@@ -247,15 +244,12 @@ async def run_telegram_consumer():
         "Telegram consumer запущен → группа %s, слушает %s",
         TELEGRAM_GROUP_ID, QUEUE_RESULTS_TELEGRAM,
     )
-    logger.info(
-        "Без рендера (оригинал): %s",
-        ", ".join(sorted(NO_RENDER_MARKETPLACES)) or "—",
-    )
 
     async with queue.iterator() as queue_iter:
         async for message in queue_iter:
             async with message.process():
                 try:
+                    update_last_message()
                     data = json.loads(message.body.decode())
                     url = data.get("url", "?")
 

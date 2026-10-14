@@ -10,6 +10,8 @@ WB закрыл анонимный доступ к card.wb.ru. API живёт н
   - xinfo-строку параметров из localStorage['geo-data-v1-...'].data.xinfo
   - Живую залогиненную сессию в Chrome
 
+Credentials собираются на каждый запрос (кэша нет — токен может меняться).
+
 Работает ТОЛЬКО через Chrome CDP. Если CDP недоступен — возвращает
 success=False с понятной ошибкой.
 """
@@ -25,7 +27,7 @@ from urllib.parse import urlencode
 import httpx
 
 from core.models import ProductData
-from .base import BaseParser
+from .base import BaseParser, cdp_wait_for_load
 
 logger = logging.getLogger("wildberries")
 
@@ -314,7 +316,7 @@ class WildberriesParser(BaseParser):
                 return status, body, None
 
             # === 3. Найти URL картинки ===
-            image_url = self._cdp_find_image(send, sku)
+            image_url = self._cdp_find_image(ws, send, sku)
             return status, body, image_url
 
         except Exception as e:
@@ -327,7 +329,7 @@ class WildberriesParser(BaseParser):
                 except Exception:
                     pass
 
-    def _cdp_find_image(self, send, sku: str) -> Optional[str]:
+    def _cdp_find_image(self, ws, send, sku: str) -> Optional[str]:
         """Ищет URL главной картинки товара."""
         card_url = f"https://www.wildberries.ru/catalog/{sku}/detail.aspx"
 
@@ -352,10 +354,9 @@ class WildberriesParser(BaseParser):
             logger.info(f"image (HTML): {url}")
             return url
 
-        # === Попытка 2: навигация + DOM ===
         logger.info("image: HTML не дал URL, навигирую на карточку...")
         send("Page.navigate", {"url": card_url})
-        time.sleep(5)
+        cdp_wait_for_load(ws, timeout_s=12.0, url_contains=f"/catalog/{sku}/")
 
         dom_js = r"""
         (() => {

@@ -6,38 +6,27 @@ class Settings:
     APP_NAME = "Marketplace Parser API"
     VERSION = "1.0.0"
     DESCRIPTION = "API для парсинга товаров с маркетплейсов"
-
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
-
-    # CDP
-    CDP_HOST: str = os.getenv("CDP_HOST", "127.0.0.1")
-    CDP_PORT: int = int(os.getenv("CDP_PORT", "9222"))
-
-    # Автоопределение в Docker
-    @classmethod
-    def _resolve_cdp_host(cls) -> str:
-        """Если в Docker — использовать host.docker.internal."""
-        import os
-        if os.path.exists("/.dockerenv"):
-            return os.getenv("CDP_HOST", "host.docker.internal")
-        return os.getenv("CDP_HOST", "127.0.0.1")
-
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
-    # Таймауты для API-запросов (в секундах)
     API_TIMEOUT = 15
     API_RETRIES = 3
-
-    # User-Agent для запросов
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
-
-    # CORS
     ALLOWED_ORIGINS = ["*"]
+
+    @property
+    def CDP_HOST(self) -> str:
+        # читаем env каждый раз
+        default = "host.docker.internal" if os.path.exists("/.dockerenv") else "127.0.0.1"
+        return os.getenv("CDP_HOST", default)
+
+    @property
+    def CDP_PORT(self) -> int:
+        return int(os.getenv("CDP_PORT", "9222"))
 
 
 settings = Settings()

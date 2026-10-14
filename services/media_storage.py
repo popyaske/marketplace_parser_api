@@ -2,16 +2,19 @@
 import hashlib
 import logging
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+MIN_FREE_BYTES = int(os.getenv("MEDIA_MIN_FREE_BYTES", str(500 * 1024 * 1024)))  # 500 MB
 MEDIA_ROOT = Path(os.getenv("MEDIA_ROOT", "/app/media"))
 PHOTOS_DIR = MEDIA_ROOT / "photos"
 VIDEOS_DIR = MEDIA_ROOT / "videos"
 MUSIC_DIR = MEDIA_ROOT / "music"
+
 
 def ensure_dirs() -> None:
     for d in (PHOTOS_DIR, VIDEOS_DIR, MUSIC_DIR):
@@ -29,8 +32,19 @@ def _guess_ext(url: str) -> str:
     return ".jpg"
 
 
+def _has_free_space(path: str, min_bytes: int = MIN_FREE_BYTES) -> bool:
+    try:
+        usage = shutil.disk_usage(path)
+        return usage.free >= min_bytes
+    except OSError:
+        return True
+
+
 def save_photo(data: bytes, url: str, source: str) -> Optional[str]:
     """Сохраняет фото на диск. Возвращает локальный путь или None."""
+    if not _has_free_space(str(PHOTOS_DIR)):
+        logger.error("save_photo: недостаточно места на диске (<%d MB) — пропускаю", MIN_FREE_BYTES // 1024 // 1024)
+        return None
     try:
         ensure_dirs()
         h = hashlib.md5(url.encode()).hexdigest()[:16]

@@ -13,6 +13,22 @@ def _check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _scale9x16_chain(idx: int, W: int, H: int, fps: int) -> str:
+    """
+    Фон = вся картинка, растянутая на W×H + размытие.
+    Передний план = картинка по ширине W, с сохранением пропорций.
+    Overlay по центру.
+    """
+    return (
+        f"[{idx}:v]split=2[bg{idx}_src][fg{idx}_src];"
+        f"[bg{idx}_src]scale={W}:{H}:force_original_aspect_ratio=increase,"
+        f"crop={W}:{H},gblur=sigma=30[bg{idx}];"
+        f"[fg{idx}_src]scale={W}:-2[fg{idx}];"
+        f"[bg{idx}][fg{idx}]overlay=(W-w)/2:(H-h)/2,"
+        f"setsar=1,fps={fps}[v{idx}]"
+    )
+
+
 def create_slideshow(
     photos: list[str],
     output_path: str,
@@ -52,13 +68,7 @@ def create_slideshow(
     # scale сначала увеличиваем, потом zoompan уменьшает видимую область
     filter_parts: list[str] = []
     for i in range(n):
-        filter_parts.append(
-            f"[{i}:v]"
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},"
-            f"setsar=1,"
-            f"fps={fps}[v{i}]"
-        )
+        filter_parts.append(_scale9x16_chain(i, width, height, fps))
 
     # Переходы xfade между парами
     if n == 1:

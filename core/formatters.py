@@ -93,24 +93,22 @@ class TextGenerator:
     def generate(cls, product: ProductData) -> str:
         """
         Генерация готового текста поста.
-
-        Логика «Было / Стало»:
-          1. Если есть зачёркнутая цена (price_original_rub):
-             Было = зачёркнутая, Стало = обычная (price_rub)
-          2. Если зачёркнутой нет, но есть цена с картой (price_with_plus):
-             Было = обычная, Стало = с картой
-          3. Если есть только обычная:
-             Стало = обычная, без строки «Было»
-          4. Если есть только с картой:
-             Стало = с картой, без строки «Было»
-          5. Если ничего — «Стало: Не найдено»
         """
         price_rub = cls._fmt(product.price_rub)
         price_plus = cls._fmt(product.price_with_plus)
         price_original = cls._fmt(product.price_original_rub)
 
-        # Определяем "Было" и "Стало"
-        if price_original and price_rub:
+        # Приоритет:
+        #   1. Есть все три: «Было = зачёркнутая, Стало = plus» — самый выгодный сценарий
+        #   2. Есть зачёркнутая + обычная: «Было = зачёркнутая, Стало = обычная»
+        #   3. Есть обычная + plus: «Было = обычная, Стало = plus»
+        #   4. Только обычная: без «Было»
+        #   5. Только plus: без «Было»
+
+        if price_original and price_rub and price_plus:
+            old_price_line = f"❌ Было: {price_original}\n"
+            discount_price = price_plus
+        elif price_original and price_rub:
             old_price_line = f"❌ Было: {price_original}\n"
             discount_price = price_rub
         elif price_rub and price_plus:

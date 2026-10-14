@@ -19,7 +19,7 @@ from typing import Any, Optional, Dict
 import httpx
 
 from core.models import ProductData
-from .base import BaseParser
+from .base import BaseParser, cdp_wait_for_load
 
 logger = logging.getLogger("ozon")
 
@@ -211,20 +211,14 @@ class OzonParser(BaseParser):
                     timeout=10.0,
                 )
                 if new_tab_resp.status_code != 200:
-                    logger.error(f"/json/new вернул HTTP {new_tab_resp.status_code}")
                     return None
                 tab = new_tab_resp.json()
-                logger.info(f"Ждём загрузку новой вкладки (8 сек)...")
-                time.sleep(8)
 
-            ws_url = tab.get("webSocketDebuggerUrl")
             tab_id = tab.get("id")
             logger.info(f"Использую вкладку: id={tab_id}, url={tab.get('url', '')[:60]}")
 
             # 2. Подключаемся к WebSocket вкладки
-            ws = create_connection(ws_url, timeout=self.timeout)
-            logger.info("WebSocket подключён")
-
+            ws = create_connection(tab["webSocketDebuggerUrl"], timeout=self.timeout)
             msg_id = [0]
 
             def send(method: str, params: dict | None = None, timeout_s: float = 60.0) -> dict:
@@ -252,7 +246,9 @@ class OzonParser(BaseParser):
                 logger.error(f"Не дождались ответа на {method}")
                 return {}
 
-            send("Runtime.enable")
+            send("Page.enable")
+            if not cdp_wait_for_load(ws, timeout_s=15.0, url_contains="ozon.ru"):
+                logger.warning("ozon: страница не догрузилась за 15 сек, продолжаю")
 
             # 3. Выполняем fetch ИЗНУТРИ страницы ozon.ru
             logger.info(f"Выполняю fetch: {api_url[:80]}...")
@@ -536,44 +532,48 @@ class OzonParser(BaseParser):
                 if parsed.get("price_original") is None and dom_prices.get("price_original"):
                     parsed["price_original"] = dom_prices["price_original"]
 
-        card_price = parsed.get("card_price")  # 388₽ (зелёная)
-        regular_price = parsed.get("price")  # 431₽ (обычная)
-        original = parsed.get("price_original")  # 2800₽ (зачёркнутая)
+        card_price = parsed.get("card_price")  # цена с Ozon Card (зелёная, меньшая)
+        regular_price = parsed.get("price")  # обычная цена
+        original = parsed.get("price_original")  # зачёркнутая
 
-        if card_price and regular_price and card_price < regular_price:
-            # Основная — зелёная
-            main_price = card_price
+        # Заполняем все три поля честно.
+        # price_rub        — «обычная» цена (если есть); иначе — card_price
+        # price_with_plus  — цена с картой, если она меньше обычной
+        # price_original_rub — зачёркнутая, если она больше «обычной»
 
-            # «Было» — зачёркнутая, если она есть и больше основной.
-            # Иначе — обычная (если больше основной).
-            if original and original > main_price:
-                old_price = original
-            elif regular_price > main_price:
-                old_price = regular_price
-            else:
-                old_price = None
+        price_rub = None
+        price_plus = None
+        price_orig = None
 
-            plus_price = None
-            logger.info(
-                "ozon: main=%s₽ (Ozon Card), было=%s₽, "
-                "обычная=%s₽, зачёркнутая=%s₽",
-                main_price, old_price, regular_price, original,
-            )
+        if regular_price and card_price and card_price < regular_price:
+            # Классический Ozon: card < regular
+            price_rub = regular_price
+            price_plus = card_price
+            price_orig = original if (original and original > regular_price) else None
+        elif card_price and (not regular_price or card_price >= regular_price):
+            # Card как основная (regular отсутствует или больше/равна)
+            price_rub = card_price
+            price_plus = None
+            price_orig = original if (original and original > card_price) else regular_price
+        elif regular_price:
+            price_rub = regular_price
+            price_plus = None
+            price_orig = original
         else:
-            # Фолбэк — как было (без Ozon Card)
-            main_price = regular_price
-            old_price = original
-            plus_price = card_price
-            logger.info(
-                "ozon: main=%s₽ (обычная), было=%s₽, plus=%s₽",
-                main_price, old_price, plus_price,
-            )
+            price_rub = None
+            price_plus = None
+            price_orig = original
+
+        logger.info(
+            "ozon: rub=%s, plus=%s, orig=%s (card=%s, regular=%s)",
+            price_rub, price_plus, price_orig, card_price, regular_price,
+        )
 
         return ProductData(
             title=parsed.get("title") or "Не найдено",
-            price_rub=main_price,
-            price_with_plus=plus_price,
-            price_original_rub=old_price,
+            price_rub=price_rub,
+            price_with_plus=price_plus,
+            price_original_rub=price_orig,
             url=f"https://www.ozon.ru{path}",
             marketplace=self.marketplace,
             sku=self.extract_sku(url),

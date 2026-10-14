@@ -6,6 +6,7 @@ import aio_pika
 
 from .connection import broker, QUEUE_RESULTS_STORAGE
 from db import save_product
+from worker_health import update_last_message
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,7 @@ async def run_storage_consumer():
         async for message in queue_iter:
             async with message.process():
                 try:
+                    update_last_message()
                     data = json.loads(message.body.decode())
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON: {e}")
