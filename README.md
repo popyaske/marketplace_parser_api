@@ -19,6 +19,7 @@
 - [Парсеры](#парсеры)
 - [Очереди RabbitMQ](#очереди-rabbitmq)
 - [Схема БД](#схема-бд)
+- [Скрипты](#скрипты)
 - [Разработка и тесты](#разработка-и-тесты)
 - [Особенности эксплуатации](#особенности-эксплуатации)
 
@@ -27,68 +28,73 @@
 ## Возможности
 
 - 🔍 **Парсинг 4 маркетплейсов**: Ozon, Wildberries, AliExpress, Яндекс.Маркет
-- 🐇 **Асинхронная обработка** через RabbitMQ (`incoming` / `results.storage` / `results.telegram` / `errors`)
+- 🐇 **Асинхронная обработка** через RabbitMQ (`incoming` / `results.storage` / `results.telegram` / `referral.manual` / `errors`)
 - 🗄 **PostgreSQL** + история цен (`PriceHistory`)
 - 📢 **Три Telegram-канала публикации**:
-  - результаты парсинга URL из очереди (`telegram_consumer`);
-  - ежедневная публикация 1 товара из каталога Такпродам (`daily_publisher`);
-  - публикация каждые 10 минут из реферальной программы Яндекс.Маркета (`yandex_referral_publisher`).
+  - обычные результаты парсинга URL из очереди (`telegram_consumer.py`);
+  - ежедневная публикация товара из каталога Такпродам (`daily_publisher.py`, в `worker.py` закомментирован);
+  - публикация из реферальной программы Яндекс.Маркета (`yandex_referral_publisher.py`).
+- 🔁 **Автороутинг Яндекс-ссылок**: `consumer.py` при получении любой ссылки `market.yandex.ru` (кроме `/search`) автоматически перекладывает её в очередь `parser.referral.manual` — публикация происходит через реферальный конвейер с получением `/cc/`-ссылки.
+- 📨 **Учёт опубликованных сообщений**: каждая успешная отправка в Telegram сохраняется в `published_messages` со ссылкой вида `https://t.me/c/.../<id>` — дашборд показывает их на вкладке «Сообщения» с кнопкой «Копировать».
 - 🎬 **VK Digest** — раз в сутки собирает 5 последних фото из Telegram-публикаций в вертикальный клип 9:16 с музыкой и трендовыми хештегами VK, публикует в личный профиль.
-- 🎨 **Стилизация карточек** товаров через Pillow (`overlay_maker`): «НИЖЕ РЫНКА», цена с иконкой Пэй, бренд, юр. текст.
+- 🎨 **Стилизация карточек** товаров через Pillow (`overlay_maker` + `scripts/card_tuner.py`): «НИЖЕ РЫНКА», цена с иконкой Пэй, бренд, юр. текст.
 - 🔗 **Автополучение реферальной ссылки** Яндекс.Маркета через CDP — клик «Поделиться» → перехват `clipboard.writeText` → ссылка `/cc/xxxxx`.
 - 🎵 **Трендовые хештеги VK** — скрапинг `vk.ru/trending` через CDP с обновлением раз в 6 часов.
 - 🚫 **Защита от дублей**: `published_products`, `published_referral_products`.
-- 📊 **React-дашборд**: фильтры, поиск, статистика, SSE-обновления, превью постов.
-- 🌐 **REST API** на FastAPI: парсинг, очередь, результаты, сравнение цен, экспорт CSV.
+- 📊 **React-дашборд**: вкладки «Товары» и «Сообщения», фильтры, поиск, статистика, SSE-обновления, превью постов.
+- 🌐 **REST API** на FastAPI: парсинг, очередь, результаты, сравнение цен, экспорт CSV, публикация рефералок, список сообщений.
 - 🧩 **Chrome CDP** для обхода антибот-защиты (x5sec, SmartCaptcha, реферальные попапы).
 - 🎟 **Поддержка промокодов** в постах (поле `promo_code` / `promo_percent`).
+- 🎬 **VK Stories** (опционально) — публикация сторис в группу/профиль с CTA-ссылкой.
 
 ---
 
 ## Архитектура
 
 ```
-                 ┌────────────┐         ┌─────────────────┐
-   HTTP ──────▶ │  parser    │ ──────▶ │  RabbitMQ       │
-  (FastAPI)      │  (main.py) │         │  parser.incoming│
-                 └────────────┘         └────────┬────────┘
-                                                 │
-                                                 ▼
-                                        ┌──────────────────┐
-                                        │  worker.py       │
-                                        └────────┬─────────┘
-                                                 │
-        ┌────────────────────────┬───────────────┼──────────────────────────┐
-        │                        │               │                          │
-        ▼                        ▼               ▼                          ▼
- parser.results.storage   parser.results.telegram     parser.errors     VK / media
-        │                        │                                        │
-        ▼                        ▼                                        ▼
- ┌─────────────┐          ┌──────────────┐                        ┌────────────────┐
- │ PostgreSQL  │          │  Telegram    │                        │  media/photos  │
- │  products   │          │   (channel)  │                        │  media/videos  │
- │  media      │          │   (group)    │                        │  media/music   │
- │  videos     │          └──────────────┘                        └────────┬───────┘
- └──────┬──────┘                  ▲                                       │
-        │                         │                                       ▼
-        │                  daily_publisher                       vk_digest_publisher
-        │                  yandex_referral_publisher                    │
-        │                         │                                       ▼
- ┌──────┴───────┐          ┌──────┴───────┐                       ┌──────────────┐
- │  frontend    │          │ Такпродам    │                       │  VK API      │
- │  (React)     │          │ Яндекс CDP   │                       │  video.save  │
- └──────────────┘          └──────────────┘                       └──────────────┘
+                 ┌────────────┐         ┌─────────────────────┐
+   HTTP ──────▶ │  parser    │ ──────▶ │  RabbitMQ           │
+  (FastAPI)      │  (main.py) │         │  parser.incoming    │
+                 └────────────┘         └──────────┬──────────┘
+                                                   │
+                                                   ▼
+                                         ┌──────────────────┐
+                                         │  worker.py       │
+                                         │  consumer.py     │
+                                         └────────┬─────────┘
+                                                  │
+       ┌──────────────────────┬───────────────────┼────────────────────┬───────────────┐
+       │                      │                   │                    │               │
+       ▼                      ▼                   ▼                    ▼               ▼
+parser.results.storage  parser.results.telegram  parser.errors  referral.manual   VK / media
+       │                      │                                     │               │
+       ▼                      ▼                                     ▼               ▼
+┌─────────────┐       ┌──────────────┐                       ┌──────────────┐  ┌──────────────┐
+│ PostgreSQL  │       │  Telegram    │                       │  Yandex      │  │  media/      │
+│  products   │       │  (group)     │                       │  referral    │  │  photos/     │
+│  media      │       │  messages    │                       │  publisher   │  │  videos/     │
+│  messages   │       │  (links)     │                       └──────────────┘  │  music/      │
+└──────┬──────┘       └──────────────┘                                         └──────┬───────┘
+       │                                                                            │
+       ▼                                                                            ▼
+┌──────────────┐                                                          ┌──────────────────┐
+│  frontend    │                                                          │  VK API          │
+│  (React)     │                                                          │  video.save      │
+│  Товары+Сообщения│                                                      │  wall.post       │
+└──────────────┘                                                          │  stories         │
+                                                                          └──────────────────┘
 ```
 
 **Процессы:**
-- **parser** — FastAPI, принимает URL, публикует в `parser.incoming`.
-- **worker** — 4 консьюмера + 3 планировщика:
-  - `consumer` — `incoming` → parse → fanout;
+- **parser** — FastAPI, принимает URL, публикует в `parser.incoming`. Эндпоинты `/parse`, `/queue/*`, `/results/*`, `/messages/*`, `/referral/publish`, `/compare`, `/health`, `/cdp-check`.
+- **worker** — 5 консьюмеров + 3 планировщика + health:
+  - `consumer` — `incoming` → parse → fanout `results` (или роутинг Яндекс-ссылок в `referral.manual`);
   - `storage_consumer` — `results.storage` → PostgreSQL;
-  - `telegram_consumer` — `results.telegram` → Telegram + сохранение фото;
+  - `telegram_consumer` — `results.telegram` → Telegram + сохранение фото и ссылки на сообщение;
+  - `run_referral_manual_consumer` — `referral.manual` → CDP-получение `/cc/`-ссылки → публикация;
+  - `yandex_referral_publisher` — каждые N секунд обходит `/page/referral_products` → публикует свежие;
   - `daily_publisher` — раз в сутки Такпродам → Telegram (в `worker.py` **закомментирован**);
-  - `yandex_referral_publisher` — каждые 10 минут Яндекс.рефералка → Telegram;
-  - `vk_digest_publisher` — раз в сутки сборка видео из накопленных фото → VK;
+  - `vk_digest_publisher` — раз в сутки сборка видео из накопленных фото → VK Клипы (+ опционально Stories);
   - `worker_health` — HTTP `/health` на :8080.
 
 ---
@@ -102,7 +108,7 @@
 | БД | PostgreSQL 16, SQLAlchemy 2 (async), asyncpg |
 | Парсинг | httpx, Playwright, `websocket-client` (Chrome CDP) |
 | Telegram | aiogram 3, aiohttp (SOCKS5/HTTP-прокси) |
-| VK | VK API 5.199 (`video.save`, `wall.post`) |
+| VK | VK API 5.199 (`video.save`, `wall.post`, `stories`) |
 | Медиа | Pillow (карточки), ffmpeg (видео 9:16) |
 | Внешние API | Такпродам (`api.takprodam.ru`), Яндекс.Маркет (SSR + CDP) |
 | Frontend | React 18, TypeScript, Vite 5, nginx |
@@ -125,19 +131,19 @@
 ├── start-chrome-cdp.bat           # Запуск Chrome с CDP на Windows
 │
 ├── broker/
-│   ├── connection.py              # Broker (aio-pika) + очереди
+│   ├── connection.py              # Broker (aio-pika) + очереди + EXCHANGE_RESULTS
 │   ├── producer.py                # send_url / send_urls
-│   ├── consumer.py                # incoming → parse → results
-│   ├── storage_consumer.py        # results → PostgreSQL
-│   ├── telegram_consumer.py       # results → Telegram + save_photo
-│   ├── daily_publisher.py         # Такпродам → Telegram (раз в сутки)
-│   ├── yandex_referral_publisher.py  # Яндекс.Маркет → Telegram (каждые 10 мин)
-│   └── vk_digest_publisher.py     # Фото → видео 9:16 → VK (раз в сутки)
+│   ├── consumer.py                # incoming → parse → results / referral.manual
+│   ├── storage_consumer.py        # results.storage → PostgreSQL
+│   ├── telegram_consumer.py       # results.telegram → Telegram + save_media + save_published_message
+│   ├── daily_publisher.py         # Такпродам → Telegram (раз в сутки, выключен в worker.py)
+│   ├── yandex_referral_publisher.py # Яндекс.Маркет → Telegram (цикл + manual consumer)
+│   └── vk_digest_publisher.py     # Фото → видео 9:16 → VK (+ Stories)
 │
 ├── parsers/
 │   ├── base.py                    # BaseParser + TTLCache
 │   ├── ozon.py                    # Ozon (composer-api + CDP + DOM)
-│   ├── wildberries.py             # WB (__internal v4 + CDP/Playwright)
+│   ├── wildberries.py             # WB (__internal v4 + CDP)
 │   ├── aliexpress.py              # AliExpress (CDP + DOM)
 │   └── yandex.py                  # Яндекс.Маркет (SSR + CDP + реф. ссылки)
 │
@@ -151,22 +157,34 @@
 │   └── vk_trending.py             # Скрапер трендовых хештегов VK
 │
 ├── routers/
-│   ├── parse.py                   # POST /parse, /health, /cdp-check
-│   ├── queue.py                   # POST /queue/enqueue(-batch), /queue/status
+│   ├── parse.py                   # POST /parse, GET /health, /cdp-check
+│   ├── queue.py                   # POST /queue/enqueue(-batch), GET /queue/status
 │   ├── results.py                 # GET /results, /stats, /stream, /export/csv
+│   ├── messages.py                # GET/DELETE /messages — учёт опубликованных сообщений
+│   ├── referral.py                # POST /referral/publish — ручная публикация рефералки
 │   └── compare.py                 # POST /compare
 │
 ├── core/
 │   ├── models.py                  # ProductData, MarketplaceType
-│   └── formatters.py              # PriceFormatter, TextGenerator
+│   ├── formatters.py              # PriceFormatter, TextGenerator
+│   └── telegram_links.py          # build_message_link()
 │
 ├── config/settings.py             # CDP_HOST, CDP_PORT, LOG_LEVEL
+│
+├── scripts/
+│   ├── card_tuner.py              # GUI-тюнер карточки (Ozon/YM/WB/Ali)
+│   ├── card_tuner_old.py          # Предыдущая версия тюнера
+│   ├── check_admitad.py
+│   ├── check_aliexpress.py
+│   ├── read_result.py             # Быстрый просмотр результата парсинга
+│   └── test_card.py
 │
 └── frontend/                      # React + Vite + nginx
     ├── Dockerfile
     ├── nginx.conf
     └── src/
-        ├── App.tsx
+        ├── App.tsx                # Вкладки «Товары» / «Сообщения»
+        ├── MessagesPage.tsx       # Таблица опубликованных сообщений
         ├── api.ts
         └── styles.css
 ```
@@ -224,7 +242,7 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
   -d '{"url":"https://www.ozon.ru/product/1234567890/"}'
 ```
 
-Результат появится в дашборде через ~10 сек.
+Результат появится в дашборде через ~10 сек. Если ссылка — на `market.yandex.ru` (не `/search`), она автоматически уйдёт в реферальный конвейер.
 
 ---
 
@@ -246,7 +264,7 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
 |------------|----------|
 | `TELEGRAM_BOT_TOKEN` | Токен бота |
 | `TELEGRAM_CHANNEL_ID` | ID канала для обычных результатов |
-| `TELEGRAM_GROUP_ID` | ID группы для daily_publisher и yandex_referral (fallback = CHANNEL_ID) |
+| `TELEGRAM_GROUP_ID` | ID группы для daily_publisher / yandex_referral / referral.manual (fallback = CHANNEL_ID) |
 | `TELEGRAM_PROXY_URL` | SOCKS5/HTTP-прокси (`socks5://user:pass@host:1080`) |
 
 ### worker — Такпродам
@@ -262,10 +280,13 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
 
 ### worker — Яндекс.рефералка
 
-| Переменная | Описание |
-|------------|----------|
-| `YANDEX_REFERRAL_INTERVAL` | Интервал публикации рефералки в секундах (по умолчанию `600`) |
-| `YANDEX_REFERRAL_PAGES` | Сколько страниц рефералки обходить (по умолчанию `3`) |
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `YANDEX_AUTO_REFERRAL` | `1` | Автороутинг Яндекс-ссылок из `incoming` в `referral.manual` |
+| `YANDEX_REFERRAL_INTERVAL` | `3600` | Интервал публикации рефералки в секундах |
+| `YANDEX_REFERRAL_MAX_PAGES` | `100` | Макс. страниц пагинации рефералки за цикл |
+| `YANDEX_REFERRAL_EMPTY_STREAK` | `3` | Сколько пустых страниц подряд = конец пагинации |
+| `YANDEX_REFERRAL_PUBLISH_DELAY` | `12.0` | Пауза между постами в секундах |
 
 ### worker — VK Digest
 
@@ -284,6 +305,15 @@ curl -X POST http://localhost:8000/api/v1/queue/enqueue \
 | `VK_TRENDING_PAGES` | `2` | Сколько страниц трендов обходить |
 | `VK_TRENDING_REFRESH_SEC` | `21600` | Частота обновления трендов (6 ч) |
 | `VK_CHANNEL_LINK` | `https://t.me/PromoMP1` | Ссылка на Telegram-канал в VK-посте |
+
+### worker — VK Stories (опционально)
+
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `VK_PUBLISH_STORY` | `0` | `1` — публиковать сторис вместе с видео |
+| `VK_STORY_GROUP_ID` | `0` | ID группы для сторис (`0` — от себя) |
+| `VK_STORY_LINK_TEXT` | `more` | Текст кнопки-ссылки в сторис |
+| `VK_STORY_LINK_URL` | `VK_CHANNEL_LINK` | URL кнопки-ссылки в сторис |
 
 ### worker — Медиа
 
@@ -309,8 +339,11 @@ PUBLISH_HOUR=20
 PUBLISH_TZ_OFFSET=3
 
 # Яндекс.рефералка
-YANDEX_REFERRAL_INTERVAL=600
-YANDEX_REFERRAL_PAGES=3
+YANDEX_AUTO_REFERRAL=1
+YANDEX_REFERRAL_INTERVAL=3600
+YANDEX_REFERRAL_MAX_PAGES=100
+YANDEX_REFERRAL_EMPTY_STREAK=3
+YANDEX_REFERRAL_PUBLISH_DELAY=12.0
 
 # VK
 VK_ACCESS_TOKEN=vk1.a.xxxxx
@@ -326,6 +359,12 @@ VK_HASHTAGS_SOURCE=trending
 VK_TRENDING_PAGES=2
 VK_TRENDING_REFRESH_SEC=21600
 VK_CHANNEL_LINK=https://t.me/PromoMP1
+
+# VK Stories
+VK_PUBLISH_STORY=0
+VK_STORY_GROUP_ID=0
+VK_STORY_LINK_TEXT=more
+VK_STORY_LINK_URL=
 ```
 
 ---
@@ -370,15 +409,18 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 
 ## Источники публикаций
 
-В проекте работают **три Telegram-канала** публикации и **один VK-канал**.
+В проекте работают **три Telegram-канала** публикации (группы) и **один VK-канал**.
 
 ### 1. Обычный парсинг (`telegram_consumer.py`)
 
-- **Триггер:** URL в очереди `parser.incoming`.
+- **Триггер:** URL в очереди `parser.incoming` → результат в fanout `parser.results.fanout`.
 - **Логика:** парсинг → результат в fanout → storage + telegram.
-- **Фильтры:** `success`, `price_rub`/`price_with_plus`, `in_stock`.
-- **Целевой чат:** `TELEGRAM_CHANNEL_ID`.
-- **Бонус:** каждое фото сохраняется в `media/photos/` для будущего VK-клипа.
+- **Фильтры:** `success`, `price_rub`/`price_with_plus`, `in_stock`, `already_exists`.
+- **Целевой чат:** `TELEGRAM_GROUP_ID` (fallback `TELEGRAM_CHANNEL_ID`).
+- **Рендер:** Яндекс / WB / AliExpress — карточка через `overlay_maker`; для Ozon — оригинал.
+- **Бонус:**
+  - фото (уже отрендеренное) сохраняется в `media/photos/` для VK-клипа и в `published_media`;
+  - ссылка на пост сохраняется в `published_messages`.
 
 ### 2. Такпродам (`daily_publisher.py`)
 
@@ -391,20 +433,29 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 
 ### 3. Рефералка Яндекс.Маркета (`yandex_referral_publisher.py`)
 
-- **Триггер:** раз в `YANDEX_REFERRAL_INTERVAL` секунд (по умолчанию 600 = 10 минут).
+Работает в двух режимах:
+
+**A. Планировщик** (`run_yandex_referral_publisher`):
+- **Триггер:** раз в `YANDEX_REFERRAL_INTERVAL` секунд.
 - **Источник:** `https://market.yandex.ru/page/referral_products?tabId=TOP_REWARD`.
 - **Логика:**
-  1. CDP → загрузка страницы → `parse_search()` (SSR-состояние).
+  1. CDP → загрузка страницы → `parse_search()` (SSR).
   2. Фильтр по `published_referral_products` + наличию картинки.
-  3. До 5 попыток на товар — берётся тот, у которого получилось достать реферальную ссылку.
-  4. Для найденного товара — `_cdp_get_referral_link()` → клик → ссылка `/cc/xxx` + HTML карточки.
-  5. `_card_from_html()` парсит HTML → цены (Pay / обычная / зачёркнутая).
-  6. `save_product()` → товар появляется в дашборде.
-  7. `_send_to_telegram()` → пост с реферальной ссылкой и **стилизованной карточкой** (`render_product_card`).
-  8. `mark_referral_published()` → защита от повторной публикации.
-- **Целевой чат:** `TELEGRAM_GROUP_ID`.
+  3. Для каждого свежего — `_publish_candidate()`: `_cdp_get_referral_link()` → `/cc/xxx` + HTML карточки.
+  4. `_card_from_html()` парсит HTML → цены (Pay / обычная / зачёркнутая).
+  5. `save_product()` → товар в дашборде; `save_media()` → фото для VK.
+  6. `_send_to_telegram()` → пост с реферальной ссылкой и **стилизованной карточкой** (`render_product_card`).
+  7. `save_published_message()` → ссылка на пост в `published_messages`.
+  8. `mark_referral_published()` → защита от повтора.
+- **TTL-очистка:** раз в сутки удаляются записи старше 30 дней (`cleanup_old_referral_publications`).
 
-**Особенности текста поста:** цена Яндекс Пэй показывается как основная, обычная (или зачёркнутая) — как «Было».
+**B. Ручной консьюмер** (`run_referral_manual_consumer`):
+- Слушает `parser.referral.manual`.
+- Туда попадают:
+  - URL от пользователя через `POST /api/v1/referral/publish`;
+  - автоматически — любые Яндекс-ссылки из `parser.incoming` при `YANDEX_AUTO_REFERRAL=1`.
+- Использует `_cdp_lock` (общий с планировщиком), чтобы не ломать вкладку `market.yandex.ru`.
+- Если на входе `/cc/XXXX` — разворачивает через `_resolve_yandex_cc` (без следования редиректам, чтобы не попасть на SmartCaptcha), затем получает новую реферальную ссылку.
 
 ---
 
@@ -412,28 +463,21 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 
 Планировщик `vk_digest_publisher.py` раз в `VK_DIGEST_INTERVAL` (по умолчанию сутки):
 
-1. **Обновляет трендовые хештеги** раз в `VK_TRENDING_REFRESH_SEC` (6 ч) через CDP:
-   - Находит iframe `vklanding.com` внутри `vk.ru/trending`.
-   - Извлекает `#хештеги` из ссылок `/hashtag/`.
-   - Фолбэк — `VK_HASHTAGS` из `.env`.
+1. **Обновляет трендовые хештеги** раз в `VK_TRENDING_REFRESH_SEC` (6 ч) через CDP.
 2. **Берёт 5 последних неиспользованных фото** из `published_media` (у которых `video_id IS NULL`).
-3. **Стилизует каждое фото** через `overlay_maker.render_and_save()`:
-   - формат `9:16` (1080×1920);
-   - бейдж «НИЖЕ РЫНКА» (если есть зачёркнутая цена);
-   - бренд, зелёная цена + иконка Пэй;
-   - юр. текст.
+3. **Вписывает каждое фото** в 9:16 с размытой подложкой (`_fit_to_9_16`).
 4. **Собирает слайдшоу** через `ffmpeg` (`services/video_maker.py`):
-   - эффект Ken Burns (медленный зум);
-   - переходы `xfade` между кадрами;
+   - эффект Ken Burns, переходы `xfade`;
    - случайный mp3/m4a из `media/music/`;
    - длительность ≈ 5 × 3 сек = 15 сек.
 5. **Публикует в VK** (`VKClient.upload_video`):
-   - `video.save` → получает `upload_url`;
+   - `video.save` → `upload_url`;
    - POST файла;
-   - `wallpost=1` → автоматический пост на стене;
-   - текст поста — 3 случайных хештега + ссылка на Telegram.
-6. **Удаляет исходные фото** с диска и записи `published_media` после успешной публикации.
-7. **Записывает видео** в `published_videos`.
+   - `wallpost=1` → авто-пост на стене;
+   - текст поста — 3 случайных хештега + топ-5 товаров + ссылка на Telegram;
+   - **опционально Stories** при `VK_PUBLISH_STORY=1`.
+6. **Удаляет** исходные фото + промежуточные `_9x16.jpg` с диска и записи `published_media`.
+7. **Записывает видео** в `published_videos`, после публикации удаляет `mp4` с диска.
 
 Хештеги обновляются раз в 6 часов и берутся из `vk.ru/trending` (реальные тренды VK Клипов). Если скрапинг недоступен — используются значения из `VK_HASHTAGS`.
 
@@ -470,6 +514,19 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 | GET | `/results/stream` | SSE-поток новых товаров |
 | GET | `/results/export/csv` | Экспорт CSV |
 
+### Сообщения
+
+| Метод | Эндпоинт | Описание |
+|-------|----------|----------|
+| GET | `/messages` | Список опубликованных сообщений (`limit`, `offset`, `marketplace`, `only_ozon_short`) |
+| DELETE | `/messages/{id}` | Удалить запись (опционально `delete_from_telegram=true` — удалит и в TG) |
+
+### Рефералка
+
+| Метод | Эндпоинт | Описание |
+|-------|----------|----------|
+| POST | `/referral/publish` | Поставить URL `market.yandex.ru/...` в очередь `parser.referral.manual` |
+
 ### Прочее
 
 | Метод | Эндпоинт | Описание |
@@ -488,13 +545,13 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 - **Tier 2:** CDP fetch из залогиненной вкладки `ozon.ru`.
 - **Fallback:** чтение цен из DOM (`.pdp_b2h`, `.pdp_b2i`, `.pdp_b2d`).
 - **Изображения:** `webGallery.coverImage` → `images[0].src`.
+- **Логика цен:** если `cardPrice < price` — основная зелёная (Ozon Card), «было» = зачёркнутая или обычная.
 
 ### Wildberries (`parsers/wildberries.py`)
 
 - **Tier 1 (CDP):** `Bearer`-токен + `deviceid` + `xinfo` из localStorage → `fetch` на `__internal/card/cards/v4/detail`.
-- **Tier 2 (Playwright):** `page.request.get` с теми же заголовками.
 - **Кэш credentials:** 5 минут (`_creds_ttl`).
-- **Изображение:** regex по HTML карточки → DOM fallback.
+- **Изображение:** regex по HTML карточки → DOM fallback (навигация → `querySelector`).
 
 ### AliExpress (`parsers/aliexpress.py`)
 
@@ -520,17 +577,19 @@ VK_CHANNEL_LINK=https://t.me/PromoMP1
 | `parser.errors` | direct | Ошибки парсинга |
 | `parser.results.storage` | fanout | Результаты → PostgreSQL |
 | `parser.results.telegram` | fanout | Результаты → Telegram |
+| `parser.referral.manual` | direct | Ручные Яндекс-ссылки в реферальный конвейер |
 
-Exchange `parser.results.fanout` — публикует в обе очереди одновременно.
+Exchange `parser.results.fanout` — публикует в обе очереди результатов одновременно.
+Exchange `parser` (direct) — роутинг `incoming` / `errors` / `referral.manual`.
 
 ---
 
 ## Схема БД
 
 ### `products`
-Результат парсинга: `url`, `marketplace`, `title`, `price_rub`, `price_with_plus`, `price_original_rub`, `seller`, `brand`, `rating`, `in_stock`, `image_url`, `tier_used`, `post_text`, `success`, `error`, `created_at`.
+Результат парсинга: `url`, `marketplace`, `sku`, `title`, `price_rub`, `price_with_plus`, `price_original_rub`, `seller`, `brand`, `rating`, `rating_count`, `in_stock`, `image_url`, `tier_used`, `post_text`, `success`, `error`, `created_at`.
 
-UNIQUE(`url`, `marketplace`). При повторном парсинге — upsert.
+UNIQUE(`sku`, `marketplace`). При повторном парсинге — upsert + запись в `price_history`.
 
 ### `price_history`
 Каждое сохранение товара → новая запись. Поля: `product_id`, `price_rub`, `price_original_rub`, `price_with_plus`, `in_stock`, `created_at`.
@@ -539,13 +598,33 @@ UNIQUE(`url`, `marketplace`). При повторном парсинге — ups
 Дедупликация Такпродама: `takprodam_id` (UNIQUE), `product_id`, `marketplace`, `title`, `tracking_link`, `published_at`.
 
 ### `published_referral_products`
-Дедупликация Яндекс.рефералки: `product_id` (UNIQUE), `title`, `referral_link`, `published_at`. Автоочистка через 7 дней (`cleanup_old_referral_publications`).
+Дедупликация Яндекс.рефералки: `product_id` (UNIQUE), `title`, `referral_link`, `published_at`. Автоочистка через 30 дней (`cleanup_old_referral_publications`).
 
 ### `published_media`
-Фото, сохранённые для VK-клипов: `source`, `product_id`, `title`, `brand`, `price_rub`, `price_with_plus`, `price_original_rub`, `rating`, `rating_count`, `legal_text`, `promo_code`, `promo_percent`, `post_text`, `image_path`, `image_url`, `video_id` (FK на `published_videos`), `created_at`.
+Фото, сохранённые для VK-клипов: `source`, `marketplace`, `product_id`, `title`, `brand`, `price_rub`, `price_with_plus`, `price_original_rub`, `rating`, `rating_count`, `legal_text`, `promo_code`, `promo_percent`, `post_text`, `image_path`, `image_url`, `video_id` (FK на `published_videos`), `created_at`.
 
 ### `published_videos`
 Собранные клипы: `file_path`, `photo_count`, `duration_sec`, `vk_owner_id`, `vk_video_id`, `vk_post_id`, `status` (`created`/`uploaded`/`failed`), `error`, `created_at`.
+
+### `published_messages`
+Ссылки на опубликованные в Telegram сообщения: `product_id`, `chat_id`, `message_id`, `message_link`, `source_url`, `marketplace`, `title`, `created_at`.
+
+Используется для вкладки «Сообщения» в дашборде.
+
+---
+
+## Скрипты
+
+Каталог `scripts/` содержит утилиты для разработки и отладки:
+
+| Файл | Назначение |
+|------|-----------|
+| `card_tuner.py` | GUI-тюнер карточки товара. Сверху — выбор маркетплейса (Ozon / Yandex / WB / AliExpress), слева — превью, справа — ползунки параметров. Позволяет подобрать размеры шрифтов, отступы, цвета «на глаз», затем перенести значения в `DEFAULTS` внутри `overlay_maker.py`. Запуск: `python scripts/card_tuner.py scripts/test.jpg`. |
+| `card_tuner_old.py` | Предыдущая версия тюнера (для сравнения). |
+| `check_admitad.py` | Проверка парсинга Admitad-ссылок. |
+| `check_aliexpress.py` | Быстрая проверка AliExpress-парсера. |
+| `read_result.py` | Вывод последнего результата парсинга из БД. |
+| `test_card.py` | Прогон рендера карточки на тестовом изображении. |
 
 ---
 
@@ -597,6 +676,13 @@ from broker.yandex_referral_publisher import _publish_one
 asyncio.run(_publish_one())
 "
 
+# Ручная публикация конкретного URL в реферальный конвейер
+docker compose exec worker python -c "
+import asyncio
+from broker.yandex_referral_publisher import _publish_one_url
+asyncio.run(_publish_one_url('https://market.yandex.ru/card/.../1234567890'))
+"
+
 # VK Digest — собрать и загрузить клип сейчас
 docker compose exec worker python -c "
 import asyncio
@@ -617,6 +703,9 @@ import asyncio
 from broker.vk_digest_publisher import _refresh_trending_hashtags
 asyncio.run(_refresh_trending_hashtags())
 "
+
+# Проверить CDP
+curl http://localhost:8000/api/v1/cdp-check
 ```
 
 ---
@@ -624,18 +713,21 @@ asyncio.run(_refresh_trending_hashtags())
 ## Особенности эксплуатации
 
 - **CDP-вкладки должны быть залогинены.** Без этого Яндекс не покажет `copyLinkButton`, WB не отдаст данные, AliExpress покажет x5sec.
-- **Реферальная ссылка не у всех товаров.** Некоторые товары на `referral_products` не участвуют в программе — `_publish_one` пробует до 5 штук и пропускает «пустые».
+- **Реферальная ссылка не у всех товаров.** Некоторые товары на `referral_products` не участвуют в программе — `_publish_candidate` один раз пробует, при неудаче помечает товар опубликованным (referral_link=None), чтобы не пытаться повторно.
+- **Общий `_cdp_lock`** для ручного и автоматического реферального пайплайна — параллельные запросы к CDP не сломают вкладку.
 - **Сессии живут ограниченно.** Токены WB кэшируются 5 минут (`_creds_ttl`).
 - **TTL-кэш результатов:** `fetch_cached` кэширует успешный парсинг на 5 минут.
 - **Rate-limit** на `/queue/enqueue` — 30/мин с IP (slowapi).
 - **Auto-reconnect:** воркер перезапускается через 5 секунд при падении.
-- **История цен:** каждое сохранение пишет в `price_history`, даже для существующих товаров (upsert по `url + marketplace`).
+- **История цен:** каждое сохранение пишет в `price_history`, даже для существующих товаров (upsert по `sku + marketplace`).
+- **Автороутинг Яндекса:** при `YANDEX_AUTO_REFERRAL=1` любые ссылки `market.yandex.ru/...` (кроме `/search`) из `incoming` автоматически публикуются через реферальный конвейер.
 - **Дедупликация публикаций:**
   - Такпродам: `UNIQUE(published_products.takprodam_id)`.
   - Яндекс: `UNIQUE(published_referral_products.product_id)`.
 - **Очистка медиа:** раз в 30 дней `cleanup_old_media()` удаляет старые фото, использованные в видео.
-- **VK-видео:** `MIN_PHOTOS = 3` — если накоплено меньше, публикация откладывается до следующего цикла.
+- **VK-видео:** `MIN_PHOTOS = 3` — если накоплено меньше, публикация откладывается до следующего цикла. Реально ждёт `VK_PHOTOS_PER_VIDEO` (по умолчанию 5).
 - **VK-хештеги:** если `vk.ru/trending` недоступен (нет вкладки в CDP), используется `.env`-фолбэк.
+- **VK Stories:** выключены по умолчанию (`VK_PUBLISH_STORY=0`). При включении требуют расширенных прав токена.
 
 ---
 
