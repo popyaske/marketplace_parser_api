@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Домены-редиректы, которые надо распаковать
 _SHORT_URL_PATTERNS = (
     "ozon.ru/t/",
+    "ozon.ru/p/",
     "wildberries.ru/redirect",
     "ali.click",
     "aliexpress.ru/i/",

@@ -484,17 +484,35 @@ def parse_card(html: str) -> dict:
 
     # Фолбэк 4: цены, вытянутые из DOM через CDP
     if not all_prices and cdp_dom:
-        dom_prices = cdp_dom.get("prices") or []
-        if dom_prices:
-            try:
-                dom_prices = sorted(float(p) for p in dom_prices if p)
-            except Exception:
-                dom_prices = []
-        if dom_prices:
-            if price_with_plus is None:
-                price_with_plus = dom_prices[0]
-            if price_regular is None:
-                price_regular = dom_prices[-1] if len(dom_prices) > 1 else dom_prices[0]
+        # 4a. Сначала — данные из data-zone-data (самые точные)
+        zone = cdp_dom.get("zone") or {}
+        if zone:
+            if price_with_plus is None and zone.get("yaBank"):
+                price_with_plus = float(zone["yaBank"])
+            if price_regular is None and zone.get("withDiscount"):
+                price_regular = float(zone["withDiscount"])
+            if price_regular is None and zone.get("price"):
+                price_regular = float(zone["price"])
+
+        # 4b. Если зоны нет — работаем по тексту
+        if price_with_plus is None and price_regular is None:
+            dom_prices = cdp_dom.get("prices") or []
+            if dom_prices:
+                try:
+                    dom_prices = sorted(float(p) for p in dom_prices if p)
+                except Exception:
+                    dom_prices = []
+            if dom_prices:
+                if cdp_dom.get("has_pay"):
+                    # Пэй-цена — основная (зелёная), старая — вторая
+                    price_with_plus = dom_prices[0]
+                    if len(dom_prices) > 1:
+                        price_regular = dom_prices[-1]
+                else:
+                    price_regular = dom_prices[0]
+                    if len(dom_prices) > 1:
+                        price_regular = dom_prices[-1]
+
         if not title_node.get("title") and cdp_dom.get("title"):
             title_node = {**(title_node or {}), "title": cdp_dom["title"]}
 
@@ -536,6 +554,97 @@ def parse_card(html: str) -> dict:
 def extract_promo_from_card(html: str) -> dict:
     """Отключено — промокод не используется."""
     return {}
+
+def _soft_scroll_until_bottom(send, log, *, max_steps: int = 40,
+                              step_px: int = 700, delay_s: float = 0.35,
+                              viewport_w: int = 1400, viewport_h: int = 900) -> None:
+    """
+    Плавно «прокручивает» страницу колесом мыши через CDP, чтобы
+    триггерить lazy-load / infinite scroll у Яндекса.
+
+    Держит курсор в центре вьюпорта, шлёт mouseWheel порциями,
+    ждёт между шагами, останавливается, когда scrollHeight перестаёт
+    расти (или по лимиту шагов).
+    """
+    # 1) Узнаём размеры документа и вьюпорта
+    dims_raw = ((send("Runtime.evaluate", {
+        "expression": (
+            "JSON.stringify({"
+            "  sh: document.documentElement.scrollHeight || document.body.scrollHeight,"
+            "  wh: window.innerHeight,"
+            "  ww: window.innerWidth"
+            "})"
+        ),
+        "returnByValue": True,
+    }).get("result") or {}).get("result") or {}).get("value")
+
+    try:
+        dims = json.loads(dims_raw) if dims_raw else {}
+    except Exception:
+        dims = {}
+
+    cx = int(dims.get("ww", viewport_w) / 2)
+    cy = int(dims.get("wh", viewport_h) / 2)
+
+    # 2) Наводим курсор в центр вьюпорта — некоторые сайты
+    #    игнорируют wheel, если курсор вне «активной» области.
+    send("Input.dispatchMouseEvent", {
+        "type": "mouseMoved",
+        "x": cx, "y": cy,
+        "button": "none",
+        "buttons": 0,
+        "clickCount": 0,
+    }, timeout_s=2.0)
+
+    last_height = 0
+    stable_rounds = 0
+
+    for step in range(max_steps):
+        # 3) Один «щелчок» колеса
+        send("Input.dispatchMouseEvent", {
+            "type": "mouseWheel",
+            "x": cx, "y": cy,
+            "deltaX": 0,
+            "deltaY": step_px,
+            "button": "none",
+            "buttons": 0,
+        }, timeout_s=2.0)
+        time.sleep(delay_s)
+
+        # 4) Проверяем, вырос ли документ
+        sh_raw = ((send("Runtime.evaluate", {
+            "expression": (
+                "document.documentElement.scrollHeight "
+                "|| document.body.scrollHeight"
+            ),
+            "returnByValue": True,
+        }).get("result") or {}).get("result") or {}).get("value")
+        try:
+            sh = int(sh_raw) if sh_raw is not None else 0
+        except (TypeError, ValueError):
+            sh = 0
+
+        if sh > last_height:
+            last_height = sh
+            stable_rounds = 0
+        else:
+            stable_rounds += 1
+
+        # 5) Три шага подряд без прироста — считаем, что дно
+        if stable_rounds >= 3:
+            log.info("CDP: прокрутка остановлена на шаге %d (scrollHeight=%d)",
+                     step + 1, sh)
+            break
+    else:
+        log.info("CDP: прокрутка дошла до лимита %d шагов (scrollHeight=%d)",
+                 max_steps, last_height)
+
+    # 6) Вернуть страницу наверх — чтобы outerHTML содержал полный список
+    send("Runtime.evaluate", {
+        "expression": "window.scrollTo(0, 0)",
+        "returnByValue": True,
+    }, timeout_s=2.0)
+    time.sleep(0.3)
 
 # === Основной класс ===
 
@@ -756,8 +865,10 @@ class YandexParser(BaseParser):
 
             send("Page.navigate", {"url": url}, timeout_s=10.0)
 
+            # === НОВОЕ: плавная прокрутка колесом для триггера infinite scroll ===
+            _soft_scroll_until_bottom(send, log)
+
             # 4. Ждём появления признаков карточки:
-            #    readyState=complete И patches>0 И есть allPrices/baobab/withDiscount
             start = time.monotonic()
             ready = False
             last_href = ""
@@ -825,25 +936,85 @@ class YandexParser(BaseParser):
             if "allPrices" not in html and "baobab" not in html:
                 js_extract = r"""
                 (() => {
-                    const text = (sel) => {
-                        const el = document.querySelector(sel);
-                        return el ? el.textContent.trim() : null;
-                    };
                     const toNum = (s) => {
                         if (!s) return null;
                         const digits = String(s).replace(/[^\d]/g, '');
                         const n = digits ? parseInt(digits, 10) : null;
                         return n && n > 0 ? n : null;
                     };
-                    const nodes = [...document.querySelectorAll('span, div')]
-                        .filter(el => el.children.length === 0)
-                        .map(el => el.textContent.trim())
-                        .filter(t => /^\s*\d[\d\s\u00a0]*\s*₽\s*$/.test(t))
-                        .map(toNum)
-                        .filter(n => n && n > 0);
-                    const uniq = [...new Set(nodes)].sort((a,b) => a - b);
-                    const title = text('h1');
-                    return JSON.stringify({ title: title, prices: uniq });
+
+                    // === 1. data-auto атрибуты (стабильные у Яндекса) ===
+                    const pickAuto = (name) => {
+                        const el = document.querySelector(`[data-auto="${name}"]`);
+                        return el ? toNum(el.textContent) : null;
+                    };
+
+                    let price_current = pickAuto('snippet-price-current'); // Пэй-цена, зелёная
+                    let price_old = pickAuto('snippet-price-old');         // зачёркнутая
+
+                    // === 2. Фолбэк — берём текст родителя, а не отдельного span ===
+                    if (price_current === null) {
+                        const el = document.querySelector('[data-auto="snippet-price-current"]');
+                        if (el) {
+                            // parent может содержать "13 708 ₽"
+                            const parent = el.closest('div, span') || el.parentElement;
+                            price_current = toNum(parent ? parent.textContent : el.textContent);
+                        }
+                    }
+                    if (price_current === null) {
+                        // грубый фолбэк: ищем среди всех span/div текст "N ₽"
+                        const re = /^\s*\d[\d\s\u00a0]*\s*₽\s*$/;
+                        const nodes = [...document.querySelectorAll('span, div')]
+                            .filter(el => el.children.length === 0)
+                            .map(el => el.textContent.trim())
+                            .filter(t => re.test(t))
+                            .map(toNum)
+                            .filter(n => n && n > 0);
+                        const uniq = [...new Set(nodes)].sort((a, b) => a - b);
+                        if (uniq.length) {
+                            price_current = uniq[0];
+                            if (uniq.length > 1) price_old = uniq[uniq.length - 1];
+                        }
+                    }
+
+                    // === 3. Признак "Пэй" — есть ли метка рядом с current price ===
+                    let has_pay = false;
+                    const curEl = document.querySelector('[data-auto="snippet-price-current"]');
+                    if (curEl) {
+                        const cont = curEl.closest('div');
+                        if (cont && cont.textContent && cont.textContent.includes('Пэй')) {
+                            has_pay = true;
+                        }
+                    }
+                    if (!has_pay) {
+                        has_pay = !!document.querySelector('[data-auto="snippet-price-current"] [class*="color_price-term"]')
+                              || /Пэй/.test(document.body.innerText);
+                    }
+
+                    // === 4. data-zone-data родителя productSnippet (самый надёжный источник) ===
+                    let zone_prices = null;
+                    const zoneEl = document.querySelector('[data-zone-name="productSnippet"][data-zone-data]');
+                    if (zoneEl) {
+                        try {
+                            const zd = JSON.parse(zoneEl.getAttribute('data-zone-data'));
+                            const addl = zd.additionalPrices || [];
+                            const yaBank = addl.find(p => p.priceType === 'yaBank');
+                            const withDisc = addl.find(p => p.priceType === 'withDiscount');
+                            zone_prices = {
+                                price: zd.price || null,
+                                yaBank: yaBank ? yaBank.priceValue : null,
+                                withDiscount: withDisc ? withDisc.priceValue : null,
+                            };
+                        } catch (e) {}
+                    }
+
+                    const title = (document.querySelector('h1') || {}).textContent || null;
+                    return JSON.stringify({
+                        title: title,
+                        prices: [price_current, price_old].filter(n => n),
+                        has_pay: has_pay,
+                        zone: zone_prices,
+                    });
                 })()
                 """
                 extra = evaluate(js_extract, timeout_s=5.0)
@@ -1200,6 +1371,207 @@ class YandexParser(BaseParser):
 
         except Exception as e:
             log.exception("CDP ошибка при получении реферальной ссылки: %s", e)
+            return None
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def _cdp_fetch_referral_page(
+            self, url: str, initial_timeout: float = 15.0,
+            max_scroll_steps: int = 20,
+    ) -> Optional[str]:
+        """
+        Открывает /page/referral_products в CDP, ждёт первые DOM-сниппеты
+        (data-zone-name="productSnippet"), прокручивает страницу до конца,
+        чтобы триггерить InfinityLoader и подгрузить страницы 2, 3, ...,
+        после чего возвращает outerHTML.
+
+        Не переиспользует _cdp_fetch_html, потому что для referral-страницы
+        условия готовности другие: ждём productSnippet, а не allPrices/baobab.
+        """
+        try:
+            from websocket import create_connection
+        except ImportError:
+            log.error("websocket-client не установлен")
+            return None
+
+        ws = None
+        try:
+            tabs_resp = httpx.get(
+                f"http://{self.cdp_host}:{self.cdp_port}/json/list",
+                timeout=5.0,
+            )
+            if tabs_resp.status_code != 200:
+                log.error("CDP /json/list вернул HTTP %s", tabs_resp.status_code)
+                return None
+            tabs = tabs_resp.json()
+
+            tab = None
+            for t in tabs:
+                if t.get("type") != "page":
+                    continue
+                tu = t.get("url") or ""
+                if _YANDEX_DOMAIN not in tu:
+                    continue
+                if any(x in tu for x in ("/showcaptcha", "/captcha", "about:blank")):
+                    continue
+                tab = t
+                break
+
+            if not tab:
+                log.info("CDP referral: вкладки market.yandex.ru нет, создаю новую")
+                new_tab = httpx.put(
+                    f"http://{self.cdp_host}:{self.cdp_port}/json/new?"
+                    f"{quote(url, safe='')}",
+                    timeout=10.0,
+                )
+                if new_tab.status_code != 200:
+                    return None
+                tab = new_tab.json()
+                time.sleep(5)
+
+            ws_url = tab.get("webSocketDebuggerUrl")
+            if not ws_url:
+                return None
+
+            ws = create_connection(ws_url, timeout=self.timeout)
+            msg_id = [0]
+
+            def send(method: str, params: Optional[dict] = None,
+                     timeout_s: float = 30.0) -> dict:
+                msg_id[0] += 1
+                current_id = msg_id[0]
+                payload = {"id": current_id, "method": method}
+                if params:
+                    payload["params"] = params
+                ws.send(json.dumps(payload))
+
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    ws.settimeout(max(0.1, deadline - time.monotonic()))
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        return {}
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("id") == current_id:
+                        return data
+                return {}
+
+            def evaluate(expression: str, timeout_s: float = 30.0) -> Any:
+                res = send(
+                    "Runtime.evaluate",
+                    {"expression": expression, "returnByValue": True},
+                    timeout_s=timeout_s,
+                )
+                return (res.get("result") or {}).get("result", {}).get("value")
+
+            send("Runtime.enable")
+            send("Page.enable")
+
+            try:
+                send("Network.enable", timeout_s=5.0)
+                send("Network.setCacheDisabled", {"cacheDisabled": True}, timeout_s=5.0)
+            except Exception:
+                pass
+
+            send("Page.navigate", {"url": url}, timeout_s=10.0)
+
+            log.info("CDP referral: жду productSnippet…")
+            start = time.monotonic()
+            initial_count = 0
+            while time.monotonic() - start < initial_timeout:
+                raw = evaluate(
+                    "document.querySelectorAll('[data-zone-name=\"productSnippet\"]').length",
+                    timeout_s=3.0,
+                )
+                try:
+                    initial_count = int(raw or 0)
+                except (TypeError, ValueError):
+                    initial_count = 0
+                if initial_count >= 12:
+                    break
+                time.sleep(0.25)
+
+            if initial_count < 12:
+                title = evaluate("document.title", timeout_s=3.0) or ""
+                if "captcha" in title.lower() or "Подтвердите" in title:
+                    log.warning("CDP referral: капча (title=%r)", title[:100])
+                    return None
+                log.warning(
+                    "CDP referral: первые сниппеты не догрузились за %.0fs (count=%d)",
+                    initial_timeout, initial_count,
+                )
+            else:
+                log.info("CDP referral: загружено %d productSnippet", initial_count)
+
+            last_count = -1
+            last_page = -1
+            stable = 0
+            for _ in range(max_scroll_steps):
+                raw = evaluate(
+                    r"""
+                    (() => {
+                        const se = document.scrollingElement || document.documentElement;
+                        se.scrollTop = se.scrollHeight;
+                        const ph = document.querySelector(
+                            '[data-auto="infinityPlaceholder"], '
+                            + '[data-auto="infifinityButton"]'
+                        );
+                        if (ph) ph.scrollIntoView({block: 'end'});
+                        const pages = [...document.querySelectorAll('[data-page]')]
+                            .map(e => +e.dataset.page || 0);
+                        return JSON.stringify({
+                            count: document.querySelectorAll(
+                                '[data-zone-name="productSnippet"]'
+                            ).length,
+                            maxPage: Math.max(0, ...pages),
+                        });
+                    })()
+                    """,
+                    timeout_s=5.0,
+                )
+                try:
+                    info = json.loads(raw) if raw else {}
+                except Exception:
+                    info = {}
+
+                cur_count = int(info.get("count") or 0)
+                cur_page = int(info.get("maxPage") or 0)
+
+                if cur_count == last_count and cur_page == last_page:
+                    stable += 1
+                    if stable >= 3:
+                        break
+                else:
+                    stable = 0
+
+                last_count = cur_count
+                last_page = cur_page
+                time.sleep(1.0)
+
+            log.info(
+                "CDP referral: после прокрутки productSnippet=%d, max data-page=%d",
+                last_count, last_page,
+            )
+
+            time.sleep(0.3)
+            html = evaluate("document.documentElement.outerHTML", timeout_s=15.0)
+            if not html:
+                log.error("CDP referral: пустой outerHTML")
+                return None
+
+            log.info("CDP referral: HTML size=%d", len(html))
+            return html
+
+        except Exception as e:
+            log.exception("CDP referral: ошибка: %s", e)
             return None
         finally:
             if ws:

@@ -132,7 +132,7 @@ class TextGenerator:
 
         # Собираем текст
         text = cls.TEMPLATE.format(
-            title=product.title,
+            title=cls._safe_title(product.title, max_len=200),
             old_price_line=old_price_line,
             discount_price=discount_price,
             url=url_for_post,
@@ -144,3 +144,16 @@ class TextGenerator:
             text += f"\n\n{hashtag}"
 
         return text
+
+    @staticmethod
+    def _safe_title(title: str | None, max_len: int = 200) -> str:
+        if not title:
+            return "Не найдено"
+        title = title.strip()
+        if len(title) <= max_len:
+            return title
+        cut = title[:max_len].rstrip()
+        space = cut.rfind(" ")
+        if space > max_len - 30:
+            cut = cut[:space]
+        return cut.rstrip(" ,.;:-") + "…"

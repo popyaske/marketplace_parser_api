@@ -10,7 +10,7 @@ import logging
 
 from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, Integer, String, Text,
-    func, select, desc, UniqueConstraint, update, delete
+    func, select, desc, UniqueConstraint, update, delete, or_
 )
 from sqlalchemy.ext.asyncio import (
     AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine,
@@ -733,9 +733,10 @@ async def list_published_messages(
 
         if only_ozon_short:
             stmt = stmt.where(PublishedMessage.marketplace == "ozon")
-            stmt = stmt.where(
-                PublishedMessage.source_url.like("https://ozon.ru/t/%")
-            )
+            stmt = stmt.where(or_(
+                PublishedMessage.source_url.like("https://ozon.ru/t/%"),
+                PublishedMessage.source_url.like("https://ozon.ru/p/%"),
+            ))
 
         count_stmt = select(func.count()).select_from(stmt.subquery())
         total = (await session.execute(count_stmt)).scalar_one()

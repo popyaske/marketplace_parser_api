@@ -45,7 +45,7 @@ async def main():
         ("yandex_referral", run_yandex_referral_publisher),
         ("referral_manual", run_referral_manual_consumer),
         ("vk_digest", run_vk_digest_publisher),
-        #("daily_publisher", run_daily_publisher),
+        ("daily_publisher", run_daily_publisher),
     )
 
     while True:
