@@ -309,17 +309,31 @@ async def _make_and_upload_one():
 
     music_path = await _prepare_music()
 
-    ok = await asyncio.to_thread(
-        create_slideshow,
-        styled_paths,
-        str(video_path),
-        duration_per_photo=VK_PHOTO_DURATION,
-        width=VK_VIDEO_WIDTH,
-        height=VK_VIDEO_HEIGHT,
-        music_path=str(music_path) if music_path else None,
-    )
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(
+                create_slideshow,
+                styled_paths,
+                str(video_path),
+                duration_per_photo=VK_PHOTO_DURATION,
+                width=VK_VIDEO_WIDTH,
+                height=VK_VIDEO_HEIGHT,
+                music_path=str(music_path) if music_path else None,
+            ),
+            timeout=240.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "VK digest: create_slideshow TIMEOUT 240s "
+            "(photos=%d, music=%s) — пропускаю",
+            len(styled_paths), music_path.name if music_path else None,
+        )
+        _cleanup_empty_video(video_path)
+        return
+
     if not ok:
         logger.error("VK digest: не удалось создать видео, чищу styled и выхожу")
+        _cleanup_empty_video(video_path)
         return
 
     # Записываем факт создания видео
@@ -338,16 +352,24 @@ async def _make_and_upload_one():
     try:
         vk = VKClient(VK_ACCESS_TOKEN, VK_USER_ID)
         try:
-            # ============================================================
-            # 1. Публикуем видео в VK Клипы
-            # ============================================================
-            owner_id, vk_video_id = await asyncio.to_thread(
-                vk.upload_video,
-                str(video_path),
-                video_title,
-                post_text,
-                True,
-            )
+            try:
+                owner_id, vk_video_id = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        vk.upload_video,
+                        str(video_path),
+                        video_title,
+                        post_text,
+                        True,
+                    ),
+                    timeout=300.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error("VK digest: upload_video TIMEOUT 300s")
+                await update_published_video(
+                    video.id, status="failed", error="upload timeout",
+                )
+                return
+
             await update_published_video(
                 video.id,
                 vk_owner_id=owner_id,
@@ -410,3 +432,14 @@ async def _make_and_upload_one():
         logger.exception("VK digest: ошибка публикации: %s", e)
         await update_published_video(video.id, status="failed", error=str(e)[:500])
         return
+
+
+def _cleanup_empty_video(path) -> None:
+    """Удаляет 0-байтный mp4 после неудачной сборки."""
+    try:
+        from pathlib import Path
+        p = Path(path)
+        if p.exists() and p.stat().st_size == 0:
+            p.unlink()
+    except Exception:
+        pass

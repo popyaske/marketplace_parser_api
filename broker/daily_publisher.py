@@ -42,7 +42,10 @@ from sqlalchemy import select, desc
 
 from core.formatters import TextGenerator
 from core.models import ProductData
-from db import get_published_ids, mark_published, save_media, get_session_maker
+from db import (
+    get_published_ids, mark_published, save_media, save_product,
+    get_session_maker,
+)
 from services.marketplace import MarketplaceFactory
 from services.takprodam import TakProDamClient
 from services.media_storage import save_photo
@@ -428,6 +431,65 @@ async def _enrich_with_marketplace_data(item: dict) -> dict:
     return item
 
 
+async def _save_to_products(item: dict) -> None:
+    """
+    Пишем товар в таблицу `products` — из неё читает дашборд
+    (/api/v1/results).
+
+    Без этого вызова товар, опубликованный daily_publisher, виден в Telegram
+    и в published_products (дедуп), но НЕ виден во фронте.
+
+    Используем `parsed_sku` из `_enrich_with_marketplace_data`, чтобы
+    UNIQUE(sku, marketplace) совпадал с обычным парсингом. Если парсер
+    SKU не дал — fallback на takprodam `product_id`.
+    """
+    product = _takprodam_to_product(item)
+
+    # SKU: приоритет парсеру — иначе дубли с обычным парсингом
+    sku = (
+        item.get("parsed_sku")
+        or str(item.get("product_id") or item.get("product_sku") or "")
+    )
+
+    # post_text — для превью в дашборде. Используем тот же TextGenerator,
+    # что и остальные консьюмеры (Markdown), а не HTML — дашборд
+    # показывает его как plain text в <pre>.
+    try:
+        post_text = TextGenerator.generate(product)
+    except Exception:
+        post_text = ""
+
+    try:
+        product_id = await save_product({
+            "url": item.get("tracking_link") or item.get("external_link") or "",
+            "marketplace": product.marketplace,
+            "sku": sku,
+            "title": item.get("title"),
+            "price_rub": product.price_rub,
+            "price_with_plus": product.price_with_plus,
+            "price_original_rub": product.price_original_rub,
+            "seller": item.get("store_title") or "",
+            "brand": item.get("brand") or "",
+            "rating": item.get("rating"),
+            "rating_count": item.get("rating_count"),
+            "in_stock": True,
+            "image_url": item.get("image_url"),
+            "tier_used": "takprodam",
+            "post_text": post_text,
+            "success": True,
+            "error": None,
+        })
+        logger.info(
+            "Daily publisher: сохранён в products (id=%s, sku=%s, mp=%s)",
+            product_id, sku, product.marketplace,
+        )
+    except Exception as e:
+        logger.exception(
+            "Daily publisher: save_product упал (takprodam_id=%s): %s",
+            item.get("id"), e,
+        )
+
+
 # ============================================================
 # Такпродам → ProductData
 # ============================================================
@@ -667,6 +729,8 @@ async def _publish_one() -> bool:
                 candidate.get("id"),
             )
             return False
+
+        await _save_to_products(candidate)
 
         await mark_published(candidate)
         logger.info(

@@ -42,6 +42,26 @@ def _has_free_space(path: str, min_bytes: int = MIN_FREE_BYTES) -> bool:
 
 def save_photo(data: bytes, url: str, source: str) -> Optional[str]:
     """Сохраняет фото на диск. Возвращает локальный путь или None."""
+    # === Защита от пустых/битых байтов ===
+    if not data or len(data) < 100:
+        logger.warning(
+            "media: save_photo получил пустые/короткие байты (%d) — пропускаю (%s)",
+            len(data) if data else 0, source,
+        )
+        return None
+
+    # Быстрая проверка по magic bytes — реальный формат, а не расширение
+    head = data[:12]
+    is_jpeg = head[:3] == b"\xff\xd8\xff"
+    is_png = head[:8] == b"\x89PNG\r\n\x1a\n"
+    is_webp = head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    if not (is_jpeg or is_png or is_webp):
+        logger.warning(
+            "media: save_photo получил не-картинку (head=%r, len=%d) — пропускаю (%s)",
+            head, len(data), source,
+        )
+        return None
+
     if not _has_free_space(str(PHOTOS_DIR)):
         logger.error("save_photo: недостаточно места на диске (<%d MB) — пропускаю", MIN_FREE_BYTES // 1024 // 1024)
         return None

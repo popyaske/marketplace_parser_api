@@ -35,92 +35,204 @@ def create_slideshow(
     duration_per_photo: float = 3.0,
     width: int = 1080,
     height: int = 1920,
-    fps: int = 60,
+    fps: int = 30,
     music_path: Optional[str] = None,
 ) -> bool:
     """
-    Собирает вертикальное слайдшоу 9:16 с эффектом Ken Burns и музыкой.
+    Собирает вертикальное слайдшоу 9:16 с fade-переходами между фото
+    и (опционально) музыкой.
 
-    Возвращает True при успехе.
+    Ключевые решения:
+      * concat + fade (не xfade: в FFmpeg 7.1.5 xfade падает с "1/0 invalid"
+        на image2-входах);
+      * каждое фото нормализуется через Pillow → чистый baseline JPEG
+        (решает WebP/PNG с расширением .jpg, битые файлы и progressive JPEG,
+        на которых mjpeg-decoder падает с "No JPEG data found");
+      * битые/нечитаемые фото пропускаются, а не валят весь клип;
+      * -nostdin, stdin=DEVNULL, timeout=180 — fail-fast вместо зависания.
     """
     if not _check_ffmpeg():
         logger.error("video: ffmpeg не найден в PATH")
         return False
 
-    existing = [Path(p) for p in photos if Path(p).exists()]
-    if not existing:
+    raw_existing = [Path(p) for p in photos if Path(p).exists()]
+    if not raw_existing:
         logger.error("video: нет ни одного существующего фото")
         return False
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        try:
+            output.unlink()
+        except Exception:
+            pass
 
+    # === 1. Нормализация: любой формат → чистый baseline JPEG через Pillow ===
+    import tempfile
+    tmp_dir = Path(tempfile.mkdtemp(prefix="vk_slideshow_"))
+
+    normalized: list[Path] = []
+    for idx, src in enumerate(raw_existing):
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(src) as im:
+                im = ImageOps.exif_transpose(im)
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                dst = tmp_dir / f"{idx:02d}_{src.stem}.jpg"
+                im.save(dst, "JPEG", quality=92, optimize=False)
+                normalized.append(dst)
+                logger.info(
+                    "video: нормализовано %s (%dx%d) → %s",
+                    src.name, im.width, im.height, dst.name,
+                )
+        except Exception as e:
+            logger.warning(
+                "video: пропускаю нечитаемое фото %s: %s", src, e,
+            )
+
+    if not normalized:
+        logger.error("video: ни одного валидного фото после нормализации")
+        _cleanup_dir(tmp_dir)
+        return False
+
+    existing = normalized
     n = len(existing)
+    fade = 0.5
     total_duration = n * duration_per_photo
 
-    # Строим filter_complex:
-    #   каждый вход → scale/crop до 9:16 → zoompan (Ken Burns) → xfade между ними
     inputs: list[str] = []
     for p in existing:
-        inputs += ["-loop", "1", "-t", str(duration_per_photo), "-i", str(p)]
+        inputs += [
+            "-loop", "1",
+            "-framerate", str(fps),
+            "-t", f"{duration_per_photo:.3f}",
+            "-i", str(p),
+        ]
 
-    # Базовый фильтр для каждого фото: кроп до 9:16 + zoompan
-    # scale сначала увеличиваем, потом zoompan уменьшает видимую область
-    filter_parts: list[str] = []
+    music_ok = bool(music_path and Path(music_path).exists())
+    if music_ok:
+        inputs += ["-i", str(music_path)]
+
+    parts: list[str] = []
     for i in range(n):
-        filter_parts.append(_scale9x16_chain(i, width, height, fps))
+        fade_out_st = max(0.0, duration_per_photo - fade)
+        parts.append(
+            f"[{i}:v]"
+            f"fps={fps},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,"
+            f"format=yuv420p,"
+            f"trim=duration={duration_per_photo:.3f},"
+            f"setpts=PTS-STARTPTS,"
+            f"fade=t=in:st=0:d={fade},"
+            f"fade=t=out:st={fade_out_st:.3f}:d={fade}"
+            f"[v{i}]"
+        )
 
-    # Переходы xfade между парами
     if n == 1:
-        last_label = "v0"
+        parts.append("[v0]copy[vout]")
     else:
-        fade = 0.3
-        prev = "v0"
-        for i in range(1, n):
-            offset = i * duration_per_photo - fade * i
-            out_label = f"x{i}" if i < n - 1 else "vout"
-            filter_parts.append(
-                f"[{prev}][v{i}]xfade=transition=fade:"
-                f"duration={fade}:offset={offset:.3f}[{out_label}]"
-            )
-            prev = out_label
-        last_label = "vout"
+        concat_inputs = "".join(f"[v{i}]" for i in range(n))
+        parts.append(f"{concat_inputs}concat=n={n}:v=1:a=0[vout]")
 
-    # Формат для mp4
-    filter_parts.append(f"[{last_label}]format=yuv420p[v]")
-    filter_complex = ";".join(filter_parts)
+    filter_complex = ";".join(parts)
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    cmd += inputs
+    cmd: list[str] = [
+        "ffmpeg",
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "warning",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+    ]
 
-    if music_path and Path(music_path).exists():
-        cmd += ["-stream_loop", "-1", "-i", music_path]
-
-    cmd += ["-filter_complex", filter_complex, "-map", "[v]"]
-
-    if music_path and Path(music_path).exists():
-        cmd += ["-map", f"{n}:a", "-c:a", "aac", "-b:a", "128k", "-shortest"]
+    if music_ok:
+        cmd += [
+            "-map", f"{n}:a",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+        ]
 
     cmd += [
         "-t", f"{total_duration:.3f}",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-r", str(fps),
         "-movflags", "+faststart",
         str(output),
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=900, text=True)
-        if result.returncode != 0:
-            logger.error("video: ffmpeg вернул %d: %s", result.returncode, result.stderr[-800:])
-            return False
-        logger.info(
-            "video: создан %s (%.1f MB, %dx%d, %.1f сек)",
-            output.name, output.stat().st_size / 1e6, width, height, total_duration,
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            stdin=subprocess.DEVNULL,
         )
-        return True
     except subprocess.TimeoutExpired:
-        logger.error("video: ffmpeg таймаут 900 сек")
+        logger.error(
+            "video: ffmpeg TIMEOUT 180s (photos=%d, music=%s)",
+            n, Path(music_path).name if music_ok else None,
+        )
+        _try_unlink_empty(output)
+        _cleanup_dir(tmp_dir)
         return False
     except Exception as e:
-        logger.exception("video: ошибка ffmpeg: %s", e)
+        logger.exception("video: ffmpeg error: %s", e)
+        _try_unlink_empty(output)
+        _cleanup_dir(tmp_dir)
         return False
+
+    _cleanup_dir(tmp_dir)
+
+    if result.returncode != 0:
+        logger.error(
+            "video: ffmpeg rc=%d, stderr=%s",
+            result.returncode, (result.stderr or "")[-1200:],
+        )
+        _try_unlink_empty(output)
+        return False
+
+    if not output.exists() or output.stat().st_size == 0:
+        logger.error(
+            "video: ffmpeg rc=0, но файл пустой (stderr=%s)",
+            (result.stderr or "")[-800:],
+        )
+        _try_unlink_empty(output)
+        return False
+
+    logger.info(
+        "video: создан %s (%.1f MB, %dx%d, %.1f сек, %d фото, %dfps)",
+        output.name, output.stat().st_size / 1e6,
+        width, height, total_duration, n, fps,
+    )
+    return True
+
+
+
+
+def _try_unlink_empty(p: Path) -> None:
+    """Удаляет файл, если он есть и нулевого размера."""
+    try:
+        if p.exists() and p.stat().st_size == 0:
+            p.unlink()
+    except Exception:
+        pass
+
+
+def _cleanup_dir(d: Path) -> None:
+    """Удаляет временную папку с нормализованными фото."""
+    try:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
