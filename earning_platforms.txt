@@ -1,0 +1,43 @@
+https://perfluence.net/#homePromotion от 500 подписчиков
+https://getblogger.ru/blogger от 1000 подписчиков
+https://sharry.pro/ - до 500 подписчиков
+https://epn.bz/ru/ - от 1000 подписчиков
+https://store.admitad.com/ru/
+https://app.takprodam.ru/products/ +
+https://ads.telegram.org/ от 1000 подписчиков
+
+wildberries - ?
+
+VK:
+https://www.ozon.ru/bloggers ?
+https://market.yandex.ru/page/referral_products ?
+
+TG:
+https://market.yandex.ru/page/referral_products : yandex_market +
+https://www.ozon.ru/bloggers : ozon - руками доставать ссылку из bluestacks
+https://app.takprodam.ru : ozon +
+https://store.admitad.com/ru : aliexpress ? (нужно подключиться к AliExpress RU&CIS )
+
+парсеры: ozon, wildberries, yandex_market, aliexpress +
+
+1) подключить площадку и добавить их в моё API
+
+admitad ?
+https://developers.mitgo.com/hc/en-us - документация api admitad
+
+/market.yandex.ru/page/referral_products (когда подключу хотя бы один блог от 100+ подписчиков)
+https://yandex.ru/dev/market/affiliate/ru/reference/get-partner-link-create
+
+2) подумать над форматом видео + чтобы залетоло в реки ?!
+
+3) обновлять музыку по пятницам (6 штук из трендов)
+
+music:ru.hitmoz.org, ru.drivemusic.me
+Данные:
+...@gmail.com
++7929...
+yandex.ru:...:...
+git_token:...
+Admitad:
+client_id:...
+client_secret:...

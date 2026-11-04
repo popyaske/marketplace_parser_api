@@ -12,9 +12,6 @@ env/
 .ruff_cache/
 
 # Тесты и документация
-tests/
-*.md
-!README.md
 .pytest_cache/
 
 # IDE
@@ -30,21 +27,6 @@ tests/
 # OS
 .DS_Store
 Thumbs.db
-
-# Локальные файлы
-.env
-.env.*
-!.env.example
-*.log
-*.json
-requirements.txt
-frontend/node_modules/
-photo/
-earning_platforms.txt
-telegram.txt
-music/
-videos/
-photos/
 
 # Chrome профиль
 chrome-scraping/
