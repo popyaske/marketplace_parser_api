@@ -42,10 +42,10 @@ async def main():
         ("storage_consumer", run_storage_consumer),
         ("telegram_consumer", run_telegram_consumer),
         ("health", run_health_server),
-        #("yandex_referral", run_yandex_referral_publisher),
+        ("yandex_referral", run_yandex_referral_publisher),
         ("referral_manual", run_referral_manual_consumer),
         ("vk_digest", run_vk_digest_publisher),
-        #("daily_publisher", run_daily_publisher),
+        ("daily_publisher", run_daily_publisher),
     )
 
     while True:

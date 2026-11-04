@@ -157,6 +157,21 @@ services:
       VK_STORY_LINK_TEXT: ${VK_STORY_LINK_TEXT:-more}
       VK_STORY_LINK_URL: ${VK_STORY_LINK_URL:-}
 
+      # --- VK: качество клипа ---
+      VK_VIDEO_FPS: ${VK_VIDEO_FPS:-30}
+      VK_BG_BLUR: ${VK_BG_BLUR:-55}
+      VK_BG_BRIGHTNESS: ${VK_BG_BRIGHTNESS:--0.22}
+      VK_BG_SATURATION: ${VK_BG_SATURATION:-1.4}
+      VK_FG_FIT_WIDTH: ${VK_FG_FIT_WIDTH:-0.88}
+      VK_FG_FIT_HEIGHT: ${VK_FG_FIT_HEIGHT:-0.85}
+      VK_FG_BORDER: ${VK_FG_BORDER:-8}
+      VK_FG_BORDER_COLOR: ${VK_FG_BORDER_COLOR:-white}
+      VK_KB_ZOOM: ${VK_KB_ZOOM:-1.08}
+      VK_KB_SPEED: ${VK_KB_SPEED:-0.0006}
+      VK_TRANSITION_DURATION: ${VK_TRANSITION_DURATION:-0.5}
+      VK_TRANSITIONS: ${VK_TRANSITIONS:-fade,slideleft,slideright,wipeleft,circleopen}
+      VK_VIGNETTE: ${VK_VIGNETTE:-PI/5}
+
       # --- Медиа ---
       MEDIA_ROOT: /app/media
 

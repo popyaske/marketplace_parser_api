@@ -320,7 +320,7 @@ async def _make_and_upload_one():
                 height=VK_VIDEO_HEIGHT,
                 music_path=str(music_path) if music_path else None,
             ),
-            timeout=240.0,
+            timeout=310.0,
         )
     except asyncio.TimeoutError:
         logger.error(
